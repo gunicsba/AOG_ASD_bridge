@@ -27,6 +27,10 @@ Connect the PC to the ASD terminal's serial port using a USB-to-RS232
 adapter. The ASD interface uses a standard serial connection (no null-modem
 crossover needed -- the terminal has a DCE-style port).
 
+![RAUCH_pinout.png](RAUCH_pinout.png "RAUCH ASD pinout - Sub-D 9 female connector")
+
+Only TXD, RXD and GND are needed for the bridge (pins 1, 5, 9 on the Sub-D 9).
+
 - **Baud:** 19200
 - **Data bits:** 8, Parity: None, Stop bits: 1
 - **Flow control:** None
