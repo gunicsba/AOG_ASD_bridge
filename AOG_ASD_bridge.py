@@ -272,7 +272,7 @@ class ASDRequester:
         with self.lock:
             self.ser.write(frame)
             self.ser.flush()
-        logger.info(f"TX >> {desc} [{frame.hex()}]")
+        logger.debug(f"TX >> {desc} [{frame.hex()}]")
 
     def shutdown(self):
         """Called before the serial port closes."""
@@ -675,7 +675,7 @@ def receiver_loop(ser: serial.Serial, parser: ASDStreamParser,
             logger.debug(f"RX raw ({len(data)}): {data.hex(' ')}")
 
             for frame in parser.feed(data):
-                logger.info(f"RX << [{frame.hex()}]")
+                logger.debug(f"RX << [{frame.hex()}]")
                 req.handle_frame(frame)
 
         except Exception as e:
@@ -694,6 +694,7 @@ def udp_listener_loop(req: ASDRequester, comms_lost_zero: bool,
     logger.info(f"UDP listening on port {UDP_PORT}")
 
     broadcast = (subnet, AOG_PORT)
+    got_e5 = False
     logger.info(f"UDP broadcast -> {broadcast}")
 
     while req.running:
@@ -732,34 +733,41 @@ def udp_listener_loop(req: ASDRequester, comms_lost_zero: bool,
                 reply = build_hello_reply(req.relay_lo, req.relay_hi)
                 sock.sendto(reply, broadcast)
 
+        elif pgn == 0xE5:  # 64-section state (AgIO -> machine)
+            # 8 bytes, byte0 = sections 1-8 ... byte7 = sections 57-64.
+            # Authoritative in current AgIO; see the 0xEF note below.
+            if len(data) >= 5 + 8:
+                if not got_e5:
+                    logger.info("AgIO sends PGN 0xE5, using it for section state")
+                got_e5 = True
+                req.update_sections_from_aog(data[5], data[6])
+                logger.debug(f"AgIO 0xE5 sections lo=0x{data[5]:02X} hi=0x{data[6]:02X}")
+
         elif pgn == 0xEF:  # Machine Data -- section bits
             if len(data) > 12:
-                relay_lo = data[11]
-                relay_hi = data[12] if len(data) > 12 else 0
-                req.update_sections_from_aog(relay_lo, relay_hi)
-                logger.debug(f"AgIO sections lo=0x{relay_lo:02X} hi=0x{relay_hi:02X}")
+                # The 0xEF section bytes are stale in current AgIO and fight
+                # with 0xE5 (same finding as the TUVR bridge): only use them
+                # when AgIO doesn't send 0xE5.
+                if not got_e5:
+                    req.update_sections_from_aog(data[11], data[12])
+                    logger.debug(f"AgIO 0xEF sections lo=0x{data[11]:02X} "
+                                 f"hi=0x{data[12]:02X}")
 
-                # Send feedback to AgIO when RUNNING
+                # Feedback with no section bits, as AOG drives the sections
+                # (auto mode). AOG reads ON/OFF bits in 0xEA as physical
+                # section switches and puts those sections into manual mode;
+                # relay bits in 0xED make it revert its own commands.
                 if req.state == MachineState.RUNNING:
-                    off_lo = (~req.relay_lo) & 0xFF
-                    off_hi = (~req.relay_hi) & 0xFF
-                    sect_data = build_section_data(
-                        req.relay_lo, req.relay_hi, off_lo, off_hi)
-                    sock.sendto(sect_data, broadcast)
-
-                    from_machine = build_from_machine(
-                        req.relay_lo, req.relay_hi)
-                    sock.sendto(from_machine, broadcast)
+                    sock.sendto(build_section_data(0, 0, 0, 0), broadcast)
+                    sock.sendto(build_from_machine(0, 0), broadcast)
 
         elif pgn == 0xFE:  # Steer Data -- speed
             if len(data) > 6:
                 spd = int.from_bytes(data[5:7], "little", signed=False) * 0.1
                 req.update_speed_from_aog(spd)
                 logger.debug(f"AgIO speed={spd:.1f} km/h")
-            if len(data) > 12:
-                relay_lo = data[11]
-                relay_hi = data[12] if len(data) > 12 else 0
-                req.update_sections_from_aog(relay_lo, relay_hi)
+            if len(data) > 12 and not got_e5:
+                req.update_sections_from_aog(data[11], data[12])
 
 
 def keyboard_loop(req: ASDRequester):

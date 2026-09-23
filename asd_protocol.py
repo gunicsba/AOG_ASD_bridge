@@ -130,8 +130,9 @@ def build_write_float(obj: int, value: float, tool_id: bytes = DEFAULT_TOOL_ID,
 
 
 def parse_float_reply(f: "ASDFrame") -> Optional[float]:
-    """Value of a type-0x01 data reply (tool + index + float LE)."""
-    if f.typ != 0x01 or len(f.data) < 7:
+    """Value of a type-0x01 data reply: tool + [index] + float LE (the speed
+    reply 0x50 has no index byte)."""
+    if f.typ != 0x01 or len(f.data) < 6:
         return None
     return struct.unpack("<f", f.data[-4:])[0]
 
