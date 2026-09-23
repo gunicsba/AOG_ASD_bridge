@@ -14,6 +14,7 @@ import time
 import msvcrt
 import logging
 import os
+import struct
 import sys
 from configparser import ConfigParser
 from enum import Enum, auto
@@ -116,6 +117,7 @@ def load_config() -> ConfigParser:
             "sections": str(DEFAULT_SECTION_COUNT),
             "machine": "auto",
             "base_rate": "0",
+            "startup_scan": "1",
             "sct_hz": "2",
             "subnet": "255.255.255.255",
         }
@@ -811,40 +813,90 @@ def keyboard_loop(req: ASDRequester):
 
 
 # ---------------------------------------------------------------------------
-#  Machine auto-detection
+#  Startup object scan + machine auto-detection
 # ---------------------------------------------------------------------------
 
-def detect_machine(ser: serial.Serial, timeout_s: float = 15.0) -> str:
-    """Ask the terminal for the Quantron section object (0x55) and the Amados
-    rate object (0x00); whichever answers with data decides the mode.
-    Retries until timeout_s (terminal may still be booting), then falls back
-    to quantron."""
-    logger.info("machine = auto: detecting terminal type ...")
-    parser = ASDStreamParser()
+SCAN_REPLY_S = 0.25
+
+
+def _ask(ser: serial.Serial, parser: ASDStreamParser, frame: bytes,
+         timeout_s: float = SCAN_REPLY_S):
+    """Send one frame, return the first decoded reply (or None)."""
+    ser.reset_input_buffer()
+    ser.write(frame)
+    ser.flush()
     end = time.time() + timeout_s
     while time.time() < end:
-        ser.reset_input_buffer()
-        for frame in (build_init_request(), build_section_request(),
-                      build_read(OBJ_TARGET_RATE)):
-            ser.write(frame)
-            ser.flush()
-            time.sleep(0.1)
-        t0 = time.time()
-        while time.time() - t0 < 0.5:
-            for fr in parser.feed(ser.read(256)):
-                f = decode_frame(fr)
-                if f is None or f.typ != 0x01:
-                    continue
-                if f.obj == RESP_SECTION:
-                    logger.info("Detected Quantron-type terminal (section object 0x55)")
-                    return "quantron"
-                if f.obj == OBJ_TARGET_RATE and parse_float_reply(f) is not None:
-                    logger.info("Detected Amados-type terminal (rate object 0x00)")
-                    return "amados"
+        for fr in parser.feed(ser.read(ser.in_waiting or 1)):
+            f = decode_frame(fr)
+            if f is not None:
+                return f
+    return None
+
+
+def _describe_value(data: bytes) -> str:
+    v = data[2:]                                # after the tool ID
+    out = f"raw=[{v.hex(' ')}]"
+    if len(v) >= 4:
+        four = v[-4:]
+        out += (f"  float={struct.unpack('<f', four)[0]:.6g}"
+                f"  u32={struct.unpack('<I', four)[0]}")
+    return out
+
+
+def scan_objects(ser: serial.Serial, wait_s: float = 15.0) -> set:
+    """Read every object 0x00-0xFF once (reads only, nothing is written) and
+    log what the terminal supports. Returns the objects that answered with
+    data. Waits up to wait_s for the terminal to answer the init first."""
+    parser = ASDStreamParser()
+    end = time.time() + wait_s
+    while True:
+        f = _ask(ser, parser, build_init_request(), 0.5)
+        if f is not None and f.obj == 0x00 and f.typ == 0x03:
+            break
+        if time.time() > end:
+            logger.warning("Startup scan skipped: terminal not answering init")
+            return set()
         time.sleep(0.5)
-    logger.warning("Terminal type not detected, using quantron. Set machine = "
-                   "amados or quantron in config.ini to skip detection")
-    return "quantron"
+
+    logger.info("Startup scan: reading objects 0x00-0xFF (read only, ~10 s) ...")
+    answered, rejected, silent = set(), {}, []
+    for obj in range(0x100):
+        if obj == 0x01:                         # init object
+            continue
+        f = _ask(ser, parser, build_read(obj))
+        if f is None:
+            silent.append(obj)
+        elif f.obj == 0x00 and f.typ == REPLY_REJECT:
+            code = f.data[2] if len(f.data) > 2 else -1
+            rejected.setdefault(code, []).append(obj)
+        elif f.typ == 0x01 and f.obj == obj:
+            answered.add(obj)
+            logger.info(f"  object 0x{obj:02X}: {_describe_value(f.data)}")
+        else:
+            logger.info(f"  object 0x{obj:02X}: unexpected reply {f}")
+
+    fmt = lambda objs: " ".join(f"{o:02X}" for o in objs)
+    logger.info(f"Startup scan: {len(answered)} objects answer: {fmt(sorted(answered))}")
+    for code, objs in sorted(rejected.items()):
+        logger.info(f"Startup scan: {len(objs)} rejected (code 0x{code:02X})")
+        logger.debug(f"  rejected code 0x{code:02X}: {fmt(objs)}")
+    if silent:
+        logger.info(f"Startup scan: no reply from {fmt(silent)}")
+    return answered
+
+
+def pick_machine(answered: set) -> str:
+    if OBJ_TARGET_RATE in answered and RESP_SECTION not in answered:
+        logger.info("Detected Amados-type terminal (rate object 0x00, no section object)")
+        return "amados"
+    if RESP_SECTION in answered:
+        logger.warning("Detected section object 0x55: using section-bitmask mode "
+                       "(EXPERIMENTAL, untested on real hardware)")
+        return "quantron"
+    logger.warning("Terminal type not detected, using amados mode. Set machine = "
+                   "amados or quantron in config.ini to choose explicitly")
+    return "amados"
 
 
 # ---------------------------------------------------------------------------
@@ -899,6 +951,7 @@ def main():
     subnet = config.get("main", "subnet", fallback="255.255.255.255")
     machine = config.get("main", "machine", fallback="auto").strip().lower()
     base_rate = config.getfloat("main", "base_rate", fallback=0.0)
+    startup_scan = config.getboolean("main", "startup_scan", fallback=True)
 
     print(f"Config: machine={machine}  sections={section_count}  SCT={sct_hz}Hz  "
           f"comms_lost_zero={comms_lost_zero}  subnet={subnet}")
@@ -930,8 +983,14 @@ def main():
     )
 
     parser = ASDStreamParser()
+    answered = scan_objects(ser) if startup_scan else set()
     if machine not in ("amados", "quantron"):
-        machine = detect_machine(ser)
+        if not startup_scan:
+            answered = scan_objects(ser)
+        machine = pick_machine(answered)
+    elif machine == "quantron":
+        logger.warning("machine = quantron: section-bitmask mode is EXPERIMENTAL, "
+                       "untested on real hardware")
 
     if machine == "amados":
         requester = AmadosRequester(ser, section_count, sct_hz, config, base_rate)
