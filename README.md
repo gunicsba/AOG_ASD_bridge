@@ -2,7 +2,7 @@
 
 # AOG-ASD Bridge
 
-Bridge between **AgOpenGPS** and **ASD-compatible** sprayer/spreader terminals (Quantron, Amatron, etc.) via the ASD serial protocol.
+Bridge between **AgOpenGPS** and **ASD-compatible** sprayer/spreader terminals (Quantron, Amatron, Amados etc.) via the ASD serial protocol.
 
 AgOpenGPS sends section states via UDP. This bridge translates them into
 ASD serial commands so the terminal opens and closes sections in real time.
