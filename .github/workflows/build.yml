@@ -36,17 +36,25 @@ jobs:
           Write-Host "WARNING: icon.ico not found!"
         }
         pyinstaller --onefile --console --name "AOG-ASD" $ICON_FLAG "AOG_ASD_bridge.py"
+        pyinstaller --onefile --console --name "AOG-ASD-Sniffer" $ICON_FLAG "asd_sniffer.py"
+        pyinstaller --onefile --console --name "AOG-ASD-Probe" $ICON_FLAG "asd_probe.py"
 
     - name: Upload artifact
       uses: actions/upload-artifact@v4
       with:
         name: AOG-ASD
-        path: dist/AOG-ASD.exe
+        path: |
+          dist/AOG-ASD.exe
+          dist/AOG-ASD-Sniffer.exe
+          dist/AOG-ASD-Probe.exe
 
     - name: Create Release
       uses: softprops/action-gh-release@v2
       with:
-        files: dist/AOG-ASD.exe
+        files: |
+          dist/AOG-ASD.exe
+          dist/AOG-ASD-Sniffer.exe
+          dist/AOG-ASD-Probe.exe
         generate_release_notes: true
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -17,7 +17,8 @@ extraction.
 Baud rate: 19200, 8-N-1, no flow control.
 """
 
-from typing import List, Tuple, Optional
+import struct
+from typing import List, NamedTuple, Optional
 
 # ---------------------------------------------------------------------------
 #  Protocol constants
@@ -41,6 +42,99 @@ def _esc_byte(b: int) -> bytes:
     if b in (STX, ETX, ESC):
         return bytes([ESC, b])
     return bytes([b])
+
+
+# ---------------------------------------------------------------------------
+#  Generic frame layout (deduced from captures, both directions):
+#
+#      <obj> <type> <len> <data x len> <crc>     crc = -(sum of all) & 0xFF
+#
+#  Host requests seen: type 0x01 = write, 0x02 = read, 0x03 = init.
+#  Terminal replies use obj 0x00; type 0x04 = reject, data = obj type code.
+# ---------------------------------------------------------------------------
+
+REPLY_REJECT = 0x04
+
+
+class ASDFrame(NamedTuple):
+    obj: int
+    typ: int
+    data: bytes
+    crc_ok: bool
+
+    def __str__(self):
+        return (f"obj=0x{self.obj:02X} type=0x{self.typ:02X} "
+                f"data=[{self.data.hex(' ')}]" + ("" if self.crc_ok else " BAD-CRC"))
+
+
+def build_frame(obj: int, typ: int, data: bytes = b"") -> bytes:
+    """Build a frame from its logical fields, with CRC and escaping."""
+    body = bytes([obj, typ, len(data)]) + bytes(data)
+    body += bytes([(-sum(body)) & 0xFF])
+    frame = bytearray([STX])
+    for b in body:
+        frame.extend(_esc_byte(b))
+    frame.append(ETX)
+    return bytes(frame)
+
+
+def unescape(frame: bytes) -> bytes:
+    """Strip leading STX and ESC markers -> logical payload."""
+    out = bytearray()
+    i = 1 if frame[:1] == bytes([STX]) else 0
+    while i < len(frame):
+        if frame[i] == ESC and i + 1 < len(frame):
+            i += 1
+        out.append(frame[i])
+        i += 1
+    return bytes(out)
+
+
+def decode_frame(frame: bytes) -> Optional["ASDFrame"]:
+    """Decode a received frame (STX included, ETX excluded)."""
+    p = unescape(frame)
+    if len(p) < 4:
+        return None
+    n = p[2]
+    data = p[3:3 + n]
+    crc_ok = len(p) == 4 + n and (sum(p) & 0xFF) == 0
+    return ASDFrame(p[0], p[1], bytes(data), crc_ok)
+
+
+# ---------------------------------------------------------------------------
+#  Amazone Amados objects (found by probing; data = tool(2) + index + float LE)
+#
+#  Reads ignore the index and return the machine-wide value. Writing
+#  OBJ_TARGET_RATE with index 1 / 2 sets the left / right side rate; the
+#  terminal accepts writes silently (no reply). Index 0 = whole machine.
+# ---------------------------------------------------------------------------
+OBJ_TARGET_RATE = 0x00      # kg/ha setpoint (read: average of both sides)
+OBJ_DISTANCE = 0x10         # uint32 counter, ~1 m per count
+OBJ_ACTUAL_RATE = 0x20      # kg/ha actual, averaged over width (read only)
+OBJ_AREA = 0x30             # uint32 counter, ~10 m^2 per count
+OBJ_WIDTH = 0x40            # active working width in m (36 / 18 / 0)
+OBJ_SPEED = 0x50            # km/h
+
+SIDE_LEFT = 1
+SIDE_RIGHT = 2
+
+
+def build_read(obj: int, tool_id: bytes = DEFAULT_TOOL_ID, index: int = 0) -> bytes:
+    return build_frame(obj, 0x02, bytes(tool_id[:2]) + bytes([index]))
+
+
+def build_write_float(obj: int, value: float, tool_id: bytes = DEFAULT_TOOL_ID,
+                      index: int = 0) -> bytes:
+    return build_frame(obj, 0x01, bytes(tool_id[:2]) + bytes([index])
+                       + struct.pack("<f", value))
+
+
+def parse_float_reply(f: "ASDFrame") -> Optional[float]:
+    """Value of a type-0x01 data reply: tool + [index] + float LE (the speed
+    reply 0x50 has no index byte)."""
+    if f.typ != 0x01 or len(f.data) < 6:
+        return None
+    return struct.unpack("<f", f.data[-4:])[0]
 
 
 # ---------------------------------------------------------------------------
@@ -69,21 +163,11 @@ def build_init_config(tool_id: bytes = DEFAULT_TOOL_ID) -> List[bytes]:
     """Build the two Init Config frames (cmd 0x25 and 0x35).
 
     Returns a list of two frames to send sequentially with ~50 ms gap.
-    """
-    frames = []
-    for cmd in (0x25, 0x35):
-        crc = (0xFF - cmd - 0x02 - 0x02 - tool_id[0] - tool_id[1]) & 0xFF
 
-        frame = bytearray([STX])
-        frame.extend(_esc_byte(cmd))
-        frame.extend([ESC, 0x02])   # structural field (always escaped)
-        frame.extend([ESC, 0x02])   # structural field (always escaped)
-        frame.extend(_esc_byte(tool_id[0]))
-        frame.extend(_esc_byte(tool_id[1]))
-        frame.extend(_esc_byte(crc))
-        frame.append(ETX)
-        frames.append(bytes(frame))
-    return frames
+    The original CRC here (0xFF - sum) was one too low; the Amados rejected
+    both frames with reply 00 04 03 <cmd> 02 01. Use the generic -sum CRC.
+    """
+    return [build_frame(cmd, 0x02, tool_id[:2]) for cmd in (0x25, 0x35)]
 
 
 def build_section_request(tool_id: bytes = DEFAULT_TOOL_ID) -> bytes:
@@ -196,22 +280,33 @@ class ASDStreamParser:
     def __init__(self):
         self.buf = bytearray()
         self.in_frame = False
-        self.prev_byte: Optional[int] = None
+        self.escaped = False     # previous byte was an ESC *marker*
 
     def feed(self, chunk: bytes) -> List[bytes]:
         """Feed raw serial bytes.
 
         Returns a list of complete frame buffers (including STX, excluding ETX).
-        Each returned buffer starts with STX at index 0.
+        Each returned buffer starts with STX at index 0; ESC markers are kept.
+
+        Tracks escape state rather than the previous byte, so an escaped ESC
+        data byte (10 10) followed by ETX still closes the frame.
         """
         frames = []
 
         for b in chunk:
-            if b == STX and self.prev_byte != ESC:
+            if self.escaped:
+                self.escaped = False
+                if self.in_frame:
+                    self.buf.append(b)
+            elif b == ESC:
+                self.escaped = True
+                if self.in_frame:
+                    self.buf.append(b)
+            elif b == STX:
                 # Start new frame
                 self.in_frame = True
                 self.buf = bytearray([STX])
-            elif b == ETX and self.prev_byte != ESC:
+            elif b == ETX:
                 # End of frame
                 if self.in_frame and len(self.buf) > 1:
                     frames.append(bytes(self.buf))
@@ -219,8 +314,6 @@ class ASDStreamParser:
                 self.buf = bytearray()
             elif self.in_frame:
                 self.buf.append(b)
-
-            self.prev_byte = b
 
             # Safety: prevent buffer overflow
             if len(self.buf) > 256:
