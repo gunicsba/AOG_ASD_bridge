@@ -74,7 +74,8 @@ Press **X** to exit.
 - **Frame:** `STX <escaped payload> ETX`
 - **STX** = `0x02`, **ETX** = `0x04`, **ESC** = `0x10`
 - **Escaping:** Any payload byte equal to STX, ETX, or ESC is preceded by ESC on the wire
-- **CRC:** `0xFF - sum(specific payload bytes)` (varies per message)
+- **Payload:** `<obj> <type> <len> <data x len> <crc>` -- type `0x01` = write/data, `0x02` = read, `0x03` = init, `0x04` = reject (terminal)
+- **CRC:** `-(sum of all payload bytes) & 0xFF`
 
 ### Commands (Bridge -> Terminal)
 
@@ -102,6 +103,33 @@ The ASD protocol carries sections in 4 bytes (32 bits total):
 | `sect[1]` | Sections 9-16 |
 | `sect[2]` | Reserved |
 | `sect[3]` | Bit 7 = GPS Auto mode flag (`0x80`) |
+
+### Amazone Amados (`machine = amados`)
+
+The Amados has no section object (`0x55`/`0x25`/`0x35` are rejected). It
+exposes float values instead (data = tool ID `05 00`, index byte, float LE):
+
+| Object | Meaning | Access |
+|--------|---------|--------|
+| `0x00` | Target rate kg/ha. Read = average of both sides | Write index `1` = left side, `2` = right side (`0` = whole machine, never written by the bridge) |
+| `0x10` | Distance counter (~1 m / count) | Read |
+| `0x20` | Actual rate kg/ha, averaged over the width | Read only |
+| `0x30` | Area counter (~10 m² / count) | Read |
+| `0x40` | Active working width, m (e.g. 36 / 18 / 0) | Read |
+| `0x50` | Speed, km/h | Read |
+
+Sections are emulated with per-side rates. With `sections = 8`, sections
+1-4 are the left side and 5-8 the right side; each closed section removes
+25 % of the base rate from its side, so 1-4 closed = left side at 0.
+
+The base rate is read from the terminal (`0x00`) before the first write. If
+the terminal's target later stops matching the average of the side rates
+the bridge sent, the operator changed it on the terminal and it becomes the
+new base. Set `base_rate` to pin it instead. On exit both sides are
+restored to the base rate.
+
+The shutters are slow (a 250 -> 0 ramp needs ~10 s to be followed), so give
+AgOpenGPS enough section look-ahead.
 
 ## State Machine
 
@@ -146,6 +174,8 @@ comms_lost_zero = 1
 sections = 8
 sct_hz = 2
 subnet = 255.255.255.255
+machine = quantron
+base_rate = 0
 ```
 
 | Parameter | Default | Description |
@@ -155,6 +185,8 @@ subnet = 255.255.255.255
 | `sections` | `8` | Number of sections (4 or 8 for Quantron) |
 | `sct_hz` | `2` | Section request polling rate in Hz |
 | `subnet` | `255.255.255.255` | UDP broadcast address |
+| `machine` | `quantron` | `quantron` (section bitmask, `0x55`) or `amados` (per-side rates, see above) |
+| `base_rate` | `0` | Amados only: base rate kg/ha, `0` = read from the terminal |
 
 ## Files
 
@@ -162,6 +194,8 @@ subnet = 255.255.255.255
 |------|---------|
 | [AOG_ASD_bridge.py](AOG_ASD_bridge.py) | Main bridge. Threads: UDP, serial RX, periodic TX, keyboard |
 | [asd_protocol.py](asd_protocol.py) | ASD framing, escaping, CRC, packet builders, stream parser |
+| [asd_sniffer.py](asd_sniffer.py) | `AOG-ASD-Sniffer.exe`: passive RS232 logger (never transmits) |
+| [asd_probe.py](asd_probe.py) | `AOG-ASD-Probe.exe`: object scan, `--watch`, rate `--ramp` tests |
 | [build.bat](build.bat) | PyInstaller one-file build -> `AOG-ASD.exe` |
 | [startup.bat](startup.bat) | Convenience launcher |
 | [config.ini](config.ini) | Auto-created on first run (see above) |
