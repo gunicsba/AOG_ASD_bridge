@@ -176,7 +176,7 @@ comms_lost_zero = 1
 sections = 8
 sct_hz = 2
 subnet = 255.255.255.255
-machine = quantron
+machine = auto
 base_rate = 0
 ```
 
@@ -187,7 +187,7 @@ base_rate = 0
 | `sections` | `8` | Number of sections (4 or 8 for Quantron) |
 | `sct_hz` | `2` | Section request polling rate in Hz |
 | `subnet` | `255.255.255.255` | UDP broadcast address |
-| `machine` | `quantron` | `quantron` (section bitmask, `0x55`) or `amados` (per-side rates, see above) |
+| `machine` | `auto` | `auto` (detect at startup), `quantron` (section bitmask, `0x55`) or `amados` (per-side rates, see above) |
 | `base_rate` | `0` | Amados only: base rate kg/ha, `0` = read from the terminal |
 | `last_base_rate` | (written by the bridge) | Amados only: last learned base rate, used when the terminal reads 0 at startup |
 

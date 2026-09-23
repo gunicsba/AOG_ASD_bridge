@@ -114,7 +114,7 @@ def load_config() -> ConfigParser:
             "com": "0",
             "comms_lost_zero": "1",
             "sections": str(DEFAULT_SECTION_COUNT),
-            "machine": "quantron",
+            "machine": "auto",
             "base_rate": "0",
             "sct_hz": "2",
             "subnet": "255.255.255.255",
@@ -811,6 +811,43 @@ def keyboard_loop(req: ASDRequester):
 
 
 # ---------------------------------------------------------------------------
+#  Machine auto-detection
+# ---------------------------------------------------------------------------
+
+def detect_machine(ser: serial.Serial, timeout_s: float = 15.0) -> str:
+    """Ask the terminal for the Quantron section object (0x55) and the Amados
+    rate object (0x00); whichever answers with data decides the mode.
+    Retries until timeout_s (terminal may still be booting), then falls back
+    to quantron."""
+    logger.info("machine = auto: detecting terminal type ...")
+    parser = ASDStreamParser()
+    end = time.time() + timeout_s
+    while time.time() < end:
+        ser.reset_input_buffer()
+        for frame in (build_init_request(), build_section_request(),
+                      build_read(OBJ_TARGET_RATE)):
+            ser.write(frame)
+            ser.flush()
+            time.sleep(0.1)
+        t0 = time.time()
+        while time.time() - t0 < 0.5:
+            for fr in parser.feed(ser.read(256)):
+                f = decode_frame(fr)
+                if f is None or f.typ != 0x01:
+                    continue
+                if f.obj == RESP_SECTION:
+                    logger.info("Detected Quantron-type terminal (section object 0x55)")
+                    return "quantron"
+                if f.obj == OBJ_TARGET_RATE and parse_float_reply(f) is not None:
+                    logger.info("Detected Amados-type terminal (rate object 0x00)")
+                    return "amados"
+        time.sleep(0.5)
+    logger.warning("Terminal type not detected, using quantron. Set machine = "
+                   "amados or quantron in config.ini to skip detection")
+    return "quantron"
+
+
+# ---------------------------------------------------------------------------
 #  Console close (window X, logoff, shutdown)
 # ---------------------------------------------------------------------------
 
@@ -860,7 +897,7 @@ def main():
     section_count = config.getint("main", "sections", fallback=DEFAULT_SECTION_COUNT)
     sct_hz = config.getint("main", "sct_hz", fallback=2)
     subnet = config.get("main", "subnet", fallback="255.255.255.255")
-    machine = config.get("main", "machine", fallback="quantron").strip().lower()
+    machine = config.get("main", "machine", fallback="auto").strip().lower()
     base_rate = config.getfloat("main", "base_rate", fallback=0.0)
 
     print(f"Config: machine={machine}  sections={section_count}  SCT={sct_hz}Hz  "
@@ -893,6 +930,9 @@ def main():
     )
 
     parser = ASDStreamParser()
+    if machine not in ("amados", "quantron"):
+        machine = detect_machine(ser)
+
     if machine == "amados":
         requester = AmadosRequester(ser, section_count, sct_hz, config, base_rate)
     else:
