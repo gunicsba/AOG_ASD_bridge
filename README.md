@@ -125,8 +125,10 @@ Sections are emulated with per-side rates. With `sections = 8`, sections
 The base rate is read from the terminal (`0x00`) before the first write. If
 the terminal's target later stops matching the average of the side rates
 the bridge sent, the operator changed it on the terminal and it becomes the
-new base. Set `base_rate` to pin it instead. On exit both sides are
-restored to the base rate.
+new base. Set `base_rate` to pin it instead. On exit (X key, Ctrl+C or
+closing the console window) both sides are restored to the base rate. If
+the terminal still reads 0 at startup (e.g. the bridge was killed), the
+bridge falls back to `last_base_rate` from config.ini.
 
 The shutters are slow (a 250 -> 0 ramp needs ~10 s to be followed), so give
 AgOpenGPS enough section look-ahead.
@@ -187,6 +189,7 @@ base_rate = 0
 | `subnet` | `255.255.255.255` | UDP broadcast address |
 | `machine` | `quantron` | `quantron` (section bitmask, `0x55`) or `amados` (per-side rates, see above) |
 | `base_rate` | `0` | Amados only: base rate kg/ha, `0` = read from the terminal |
+| `last_base_rate` | (written by the bridge) | Amados only: last learned base rate, used when the terminal reads 0 at startup |
 
 ## Files
 

@@ -493,6 +493,7 @@ class AmadosRequester(ASDRequester):
         self.last_write_time = 0.0
         self.last_poll_time = 0.0
         self.poll_idx = 0
+        self.restored = False
         logger.info(f"Amados mode: {self.per_side * 2} sections, "
                     f"1-{self.per_side} = left, "
                     f"{self.per_side + 1}-{self.per_side * 2} = right, "
@@ -574,6 +575,9 @@ class AmadosRequester(ASDRequester):
 
     def shutdown(self):
         """Leave the machine spreading at the base rate on both sides."""
+        if self.restored:
+            return
+        self.restored = True
         if self.controlling and self.base_rate:
             logger.info(f"Restoring both sides to base rate {self.base_rate:.1f}")
             for side in (SIDE_LEFT, SIDE_RIGHT):
@@ -645,9 +649,22 @@ class AmadosRequester(ASDRequester):
             return
         if self.cmd[SIDE_LEFT] is None or self.cmd[SIDE_RIGHT] is None:
             # Nothing written yet: the terminal's target is the base rate
-            if target != (self.base_rate or 0.0):
+            if target <= 0:
+                # Most likely left closed by a run that was killed before it
+                # could restore; fall back to the last base we learned.
+                last = self.config.getfloat("main", "last_base_rate", fallback=0.0)
+                if last > 0 and self.base_rate != last:
+                    logger.warning(f"Terminal target is 0 (left closed by a previous "
+                                   f"run?): using last known base rate {last:.1f} kg/ha")
+                    self.base_rate = last
+                elif last <= 0 and self.base_rate is not None:
+                    logger.warning("Terminal target is 0 and no last_base_rate in "
+                                   "config.ini: set the rate on the terminal")
+                    self.base_rate = None
+                return
+            if target != self.base_rate:
                 logger.info(f"Base rate from terminal: {target:.1f} kg/ha")
-                self.base_rate = target if target > 0 else None
+                self._set_base(target)
             return
         if time.time() - self.last_write_time < AMADOS_SETTLE_S:
             return
@@ -655,8 +672,18 @@ class AmadosRequester(ASDRequester):
         if abs(target - expected) > AMADOS_REBASE_TOL and target > 0:
             logger.info(f"Target changed on terminal (expected {expected:.1f}, "
                         f"now {target:.1f}): new base rate {target:.1f} kg/ha")
-            self.base_rate = target
+            self._set_base(target)
             self.cmd = {SIDE_LEFT: None, SIDE_RIGHT: None}   # force re-apply
+
+    def _set_base(self, rate: float):
+        """Adopt a learned base rate and remember it for the next start."""
+        self.base_rate = rate
+        try:
+            if self.config.get("main", "last_base_rate", fallback="") != f"{rate:g}":
+                self.config.set("main", "last_base_rate", f"{rate:g}")
+                save_config(self.config)
+        except Exception as e:
+            logger.warning(f"Could not save last_base_rate: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -784,6 +811,41 @@ def keyboard_loop(req: ASDRequester):
 
 
 # ---------------------------------------------------------------------------
+#  Console close (window X, logoff, shutdown)
+# ---------------------------------------------------------------------------
+
+_console_handler = None     # keep a reference, or ctypes frees the callback
+
+
+def install_console_close_handler(req: ASDRequester, ser: serial.Serial):
+    """Run the normal shutdown (restore rates) when the console window is
+    closed. Windows gives the process ~5 s after CTRL_CLOSE_EVENT."""
+    global _console_handler
+    import ctypes
+    from ctypes import wintypes
+
+    @ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.DWORD)
+    def handler(event):
+        if event in (2, 5, 6):      # CLOSE, LOGOFF, SHUTDOWN
+            logger.info("Console closing -- shutting down")
+            req.running = False
+            time.sleep(0.3)
+            try:
+                req.shutdown()
+                time.sleep(0.2)
+                ser.close()
+            except Exception as e:
+                logger.warning(f"Shutdown on close failed: {e}")
+            logging.shutdown()
+            return True
+        return False                # Ctrl+C: default -> KeyboardInterrupt
+
+    _console_handler = handler
+    if not ctypes.windll.kernel32.SetConsoleCtrlHandler(handler, True):
+        logger.warning("Could not install console close handler")
+
+
+# ---------------------------------------------------------------------------
 #  Main
 # ---------------------------------------------------------------------------
 
@@ -848,6 +910,8 @@ def main():
     ]
     for t in threads:
         t.start()
+
+    install_console_close_handler(requester, ser)
 
     try:
         while requester.running:
