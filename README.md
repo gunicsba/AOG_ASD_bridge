@@ -104,6 +104,20 @@ The ASD protocol carries sections in 4 bytes (32 bits total):
 | `sect[2]` | Reserved |
 | `sect[3]` | Bit 7 = GPS Auto mode flag (`0x80`) |
 
+### Startup object scan
+
+ASD was designed for documentation (per Amazone support), and each terminal
+implements a different set of objects. At every start the bridge reads all
+objects `0x00`-`0xFF` once (reads only, about 10 s) and logs which ones
+answer, with their raw bytes and float / integer interpretation. With
+`machine = auto` the mode is chosen from that result. Set `startup_scan = 0`
+to skip it when `machine` is set explicitly.
+
+### Section bitmask mode (`machine = quantron`) -- EXPERIMENTAL
+
+Based only on Coffeetrac's ESP32 code (object `0x55`). It has not worked on
+any terminal we tested; it is selected only when the scan finds object `0x55`.
+
 ### Amazone Amados (`machine = amados`)
 
 The Amados has no section object (`0x55`/`0x25`/`0x35` are rejected). It
@@ -176,8 +190,9 @@ comms_lost_zero = 1
 sections = 8
 sct_hz = 2
 subnet = 255.255.255.255
-machine = quantron
+machine = auto
 base_rate = 0
+startup_scan = 1
 ```
 
 | Parameter | Default | Description |
@@ -187,7 +202,8 @@ base_rate = 0
 | `sections` | `8` | Number of sections (4 or 8 for Quantron) |
 | `sct_hz` | `2` | Section request polling rate in Hz |
 | `subnet` | `255.255.255.255` | UDP broadcast address |
-| `machine` | `quantron` | `quantron` (section bitmask, `0x55`) or `amados` (per-side rates, see above) |
+| `machine` | `auto` | `auto` (pick from the startup scan), `amados` (per-side rates) or `quantron` (section bitmask `0x55`, experimental) |
+| `startup_scan` | `1` | Log a read-only scan of all ASD objects at every start (~10 s) |
 | `base_rate` | `0` | Amados only: base rate kg/ha, `0` = read from the terminal |
 | `last_base_rate` | (written by the bridge) | Amados only: last learned base rate, used when the terminal reads 0 at startup |
 
