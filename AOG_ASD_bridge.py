@@ -279,6 +279,14 @@ class ASDRequester:
     def shutdown(self):
         """Called before the serial port closes."""
 
+    def on_agio_lost(self, comms_lost_zero: bool):
+        self.agio_connected = False
+        if comms_lost_zero:
+            self.update_sections_from_aog(0x00, 0x00)
+            self.update_speed_from_aog(0.0)
+        if self.state == MachineState.RUNNING:
+            self.enter_ready("AgIO timeout")
+
     # ---- state transitions ----
 
     def enter_disconnected(self, reason: str):
@@ -461,6 +469,7 @@ AMADOS_POLL_S = 0.25            # one object read per tick-group (4 objects -> 1
 AMADOS_REFRESH_S = 10.0         # re-send side rates even if unchanged
 AMADOS_SETTLE_S = 2.0           # ignore target reads this long after a write
 AMADOS_REBASE_TOL = 1.5         # kg/ha; terminal rounds setpoints to integers
+AOG_SECTIONS_TIMEOUT_S = 3.0    # no section PGN this long -> hand back to terminal
 
 
 class AmadosRequester(ASDRequester):
@@ -482,7 +491,8 @@ class AmadosRequester(ASDRequester):
         self.per_side = max(1, section_count // 2)
         self.section_mask = 0               # AOG sections, bit 0 = section 1
         self.have_sections = False
-        self.controlling = False            # set once AgIO drives us
+        self.last_sections_time = 0.0
+        self.controlling = False            # True while AgOpenGPS drives us
 
         self.base_rate: Optional[float] = base_rate if base_rate > 0 else None
         self.fixed_base = base_rate > 0
@@ -565,9 +575,14 @@ class AmadosRequester(ASDRequester):
                     logger.debug(f"TX >> READ 0x{obj:02X}")
                     self.last_poll_time = now
 
-                if self.state == MachineState.RUNNING and self.have_sections:
-                    if not self.controlling:
-                        logger.info("AgOpenGPS now controls the side rates")
+                sections_age = now - self.last_sections_time
+                if self.controlling and sections_age > AOG_SECTIONS_TIMEOUT_S:
+                    self.release(f"no section data from AgOpenGPS for "
+                                 f"{sections_age:.1f}s")
+                elif (not self.controlling and self.have_sections
+                      and self.state == MachineState.RUNNING
+                      and sections_age <= AOG_SECTIONS_TIMEOUT_S):
+                    logger.info("AgOpenGPS now controls the side rates")
                     self.controlling = True
 
                 if self.controlling and self.base_rate:
@@ -575,16 +590,37 @@ class AmadosRequester(ASDRequester):
 
             time.sleep(TICK_S)
 
+    def release(self, reason: str):
+        """Hand the machine back to the terminal: both sides to the base
+        rate, stop controlling until AgOpenGPS sends sections again."""
+        if self.base_rate and any(v is not None for v in self.cmd.values()):
+            logger.info(f"{reason}: restoring both sides to base rate "
+                        f"{self.base_rate:.1f}")
+            for side in (SIDE_LEFT, SIDE_RIGHT):
+                self.write_side(side, self.base_rate, "(restore)")
+                time.sleep(0.05)
+        else:
+            logger.info(f"{reason}: releasing control")
+        self.controlling = False
+        self.have_sections = False
+        # Forget our side values so the terminal's target is read as the
+        # base again (picks up changes made on the terminal meanwhile).
+        self.cmd = {SIDE_LEFT: None, SIDE_RIGHT: None}
+
     def shutdown(self):
         """Leave the machine spreading at the base rate on both sides."""
         if self.restored:
             return
         self.restored = True
-        if self.controlling and self.base_rate:
-            logger.info(f"Restoring both sides to base rate {self.base_rate:.1f}")
-            for side in (SIDE_LEFT, SIDE_RIGHT):
-                self.write_side(side, self.base_rate, "(restore)")
-                time.sleep(0.05)
+        if self.controlling:
+            self.release("Bridge closing")
+
+    def on_agio_lost(self, comms_lost_zero: bool):
+        # Don't zero the sections: periodic_loop hands the machine back to
+        # the terminal (base rate) once section data stops arriving.
+        self.agio_connected = False
+        if self.state == MachineState.RUNNING:
+            self.enter_ready("AgIO timeout")
 
     # ---- AgOpenGPS input ----
 
@@ -593,6 +629,7 @@ class AmadosRequester(ASDRequester):
         with self.sections_lock:
             self.section_mask = mask
             self.have_sections = True
+            self.last_sections_time = time.time()
         self._update_feedback()
 
     def _update_feedback(self):
@@ -732,12 +769,7 @@ def udp_listener_loop(req: ASDRequester, comms_lost_zero: bool,
         except socket.timeout:
             if req.agio_connected:
                 logger.info("AgIO timeout -- connection lost")
-                req.agio_connected = False
-                if comms_lost_zero:
-                    req.update_sections_from_aog(0x00, 0x00)
-                    req.update_speed_from_aog(0.0)
-                if req.state == MachineState.RUNNING:
-                    req.enter_ready("AgIO timeout")
+                req.on_agio_lost(comms_lost_zero)
             continue
         except OSError:
             if not req.running:

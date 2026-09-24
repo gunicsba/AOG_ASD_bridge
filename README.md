@@ -139,8 +139,13 @@ Sections are emulated with per-side rates. With `sections = 8`, sections
 The base rate is read from the terminal (`0x00`) before the first write. If
 the terminal's target later stops matching the average of the side rates
 the bridge sent, the operator changed it on the terminal and it becomes the
-new base. Set `base_rate` to pin it instead. On exit (X key, Ctrl+C or
-closing the console window) both sides are restored to the base rate. If
+new base. Set `base_rate` to pin it instead.
+
+Both sides are restored to the base rate (100 %) and control is handed
+back to the terminal when:
+- no section data arrives from AgOpenGPS for 3 s (AgOpenGPS or AgIO
+  closed, network lost); the bridge takes over again when it returns;
+- the bridge exits (X key, Ctrl+C or closing the console window). If
 the terminal still reads 0 at startup (e.g. the bridge was killed), the
 bridge falls back to `last_base_rate` from config.ini.
 
@@ -198,7 +203,7 @@ startup_scan = 1
 | Parameter | Default | Description |
 |-----------|---------|-------------|
 | `com` | `0` (prompt) | Serial port. Set to `0` to prompt on startup |
-| `comms_lost_zero` | `1` | Zero all sections when AgIO connection is lost |
+| `comms_lost_zero` | `1` | Section-bitmask mode only: zero all sections when AgIO is lost. Amados mode always restores the base rate instead |
 | `sections` | `8` | Number of sections (4 or 8 for Quantron) |
 | `sct_hz` | `2` | Section request polling rate in Hz |
 | `subnet` | `255.255.255.255` | UDP broadcast address |
