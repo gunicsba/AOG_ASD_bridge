@@ -27,9 +27,49 @@ Connect the PC to the ASD terminal's serial port using a USB-to-RS232
 adapter. The ASD interface uses a standard serial connection (no null-modem
 crossover needed -- the terminal has a DCE-style port).
 
-![RAUCH_pinout.png](RAUCH_pinout.png "RAUCH ASD pinout - Sub-D 9 female connector")
+![RAUCH_pinout.png](RAUCH_pinout.png "RAUCH ASD pinout - Binder 680 8-pin to Sub-D 9 female")
 
-Only TXD, RXD and GND are needed for the bridge (pins 1, 5, 9 on the Sub-D 9).
+The terminal's ASD / signal connector is a **Binder Series 680, 8-pin**
+circular connector (8 contacts + shield). The cable in the diagram is a
+Y-adapter: it passes the tractor signals (wheel speed, radar, PTO, work
+switch, 12 V, GND) straight through and taps the serial lines out to a
+Sub-D 9 female that plugs into the USB-to-RS232 adapter.
+
+### Pinout
+
+| Binder 680 pin | Signal | Wire colour (diagram) | Sub-D 9 pin |
+|:--:|--------|------|:--:|
+| 1 | Wheel speed / Radsensor | blue | – |
+| 2 | +12 V | red | – |
+| 3 | GND | black | **5** |
+| 4 | PTO / Zapfwelle | purple | – |
+| 5 | Work switch / Arbeitsstellung | brown | – |
+| 6 | Radar | light blue | – |
+| 7 | RXD | green | **3** |
+| 8 | TXD | yellow | **2** |
+| S | Shield | – | – |
+
+Only TXD, RXD and GND are needed for the bridge (Binder pins 8, 7, 3 →
+Sub-D 9 pins 2, 3, 5). Signal names are as labelled in the diagram; if you
+get no response from the terminal, try swapping TXD/RXD at the Sub-D end.
+
+> Pin numbers are as printed on the connector inserts. Always check the
+> numbering against the connector you actually have before soldering, and
+> never connect the +12 V line to the serial adapter.
+
+### Connector parts
+
+Plugs that mate with the terminal-side socket (Binder Series 680, 8-pin
+male cable connectors, solder contacts):
+
+| Part number | Description | Link |
+|-------------|-------------|------|
+| Binder 09-0571-00-08 | Series 680 male cable connector, 8-pin | [Bürklin 66F114](https://www.buerklin.com/en/p/binder/other-circular-connectors/09-0571-00-08/66F114/) |
+| Binder 09-0571-02-08 | Series 680 male cable connector, 8-pin (variant with different cable clamp range) | [Bürklin 66F134](https://www.buerklin.com/en/p/binder/other-circular-connectors/09-0571-02-08/66F134/) |
+
+Pick the variant whose cable-clamp range matches the outer diameter of the
+cable you are using (see the Binder datasheet on the product page). For
+the Sub-D side, any standard 9-pin female solder connector with hood works.
 
 - **Baud:** 19200
 - **Data bits:** 8, Parity: None, Stop bits: 1
