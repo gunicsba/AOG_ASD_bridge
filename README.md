@@ -71,6 +71,12 @@ Pick the variant whose cable-clamp range matches the outer diameter of the
 cable you are using (see the Binder datasheet on the product page). For
 the Sub-D side, any standard 9-pin female solder connector with hood works.
 
+**Ready-made cable:** Müller Elektronik sells an adapter cable for using the
+ASD application with other manufacturers' terminals (e.g. Rauch, Quantron E,
+E2): [Adapterkabel für ME-Terminals](https://roltronik.pl/de/suche-nach-hersteller-marke/565891-adapterkabel-f%C3%BCr-me-terminals.html),
+art. no. 3032254800. Key-operated ME terminals need hardware version 3.0.0 or
+later. Not tested with this bridge yet.
+
 - **Baud:** 19200
 - **Data bits:** 8, Parity: None, Stop bits: 1
 - **Flow control:** None
