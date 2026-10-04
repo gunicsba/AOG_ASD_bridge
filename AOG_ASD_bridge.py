@@ -18,8 +18,9 @@ import struct
 import sys
 from configparser import ConfigParser
 from enum import Enum, auto
-from typing import Optional
+from typing import Callable, Optional
 
+import log_archive
 from asd_protocol import (
     BAUD,
     DEFAULT_TOOL_ID,
@@ -85,21 +86,50 @@ def get_app_directory() -> str:
 APP_DIR = get_app_directory()
 exe_name = os.path.splitext(os.path.basename(sys.executable if getattr(sys, 'frozen', False)
                                               else __file__))[0]
-LOG_PATH = os.path.join(APP_DIR, f"{exe_name}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+LOG_DIR = os.path.join(APP_DIR, "logs")
+LOG_PATH = os.path.join(LOG_DIR, f"{exe_name}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+# Logs of older versions were written next to the exe
+LEGACY_LOG_PREFIXES = ("AOG-ASD_", "AOG_ASD_bridge_")
+DEFAULT_LOG_KEEP_DAYS = 7
 
-# Console stays at INFO; the file gets DEBUG (raw RX bytes, AgIO values)
-_console = logging.StreamHandler()
-_console.setLevel(LOG_LEVEL)
-_console.setFormatter(logging.Formatter(
-    "[%(asctime)s.%(msecs)03d] %(levelname)s %(message)s", datefmt="%H:%M:%S"))
-_file = logging.FileHandler(LOG_PATH, mode='w', encoding='utf-8')
-_file.setLevel(logging.DEBUG)
-_file.setFormatter(logging.Formatter(
-    "[%(asctime)s.%(msecs)03d] %(levelname)s [%(threadName)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"))
-logging.basicConfig(level=logging.DEBUG, handlers=[_console, _file])
 logger = logging.getLogger("asd")
-logger.info(f"Logging to file: {LOG_PATH}")
+
+
+def setup_logging(console: bool):
+    """Console (if any) stays at INFO; the file gets DEBUG (raw RX bytes,
+    AgIO values)."""
+    os.makedirs(LOG_DIR, exist_ok=True)
+    handlers = []
+    if console and sys.stderr is not None:
+        h = logging.StreamHandler()
+        h.setLevel(LOG_LEVEL)
+        h.setFormatter(logging.Formatter(
+            "[%(asctime)s.%(msecs)03d] %(levelname)s %(message)s", datefmt="%H:%M:%S"))
+        handlers.append(h)
+    f = logging.FileHandler(LOG_PATH, mode='w', encoding='utf-8')
+    f.setLevel(logging.DEBUG)
+    f.setFormatter(logging.Formatter(
+        "[%(asctime)s.%(msecs)03d] %(levelname)s [%(threadName)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S"))
+    handlers.append(f)
+    logging.basicConfig(level=logging.DEBUG, handlers=handlers)
+    logger.info(f"Logging to file: {LOG_PATH}")
+
+
+def archive_logs(config: ConfigParser):
+    keep_days = config.getint("main", "log_keep_days", fallback=DEFAULT_LOG_KEEP_DAYS)
+    try:
+        archived, pruned = log_archive.archive_old_logs(
+            LOG_DIR, LOG_PATH, keep_days,
+            legacy_dir=APP_DIR, legacy_prefixes=LEGACY_LOG_PREFIXES)
+    except Exception as e:
+        logger.warning(f"Log archiving failed: {e}")
+        return
+    if archived or pruned:
+        logger.info(f"Logs: {archived} older run(s) zipped into "
+                    f"{os.path.join(LOG_DIR, log_archive.ARCHIVE_SUBDIR)}"
+                    + (f", {pruned} archive(s) older than {keep_days} days removed"
+                       if pruned else ""))
 
 
 # ---------------------------------------------------------------------------
@@ -113,18 +143,36 @@ def load_config() -> ConfigParser:
     if not os.path.exists(CONFIG_PATH):
         config["main"] = {
             "com": "0",
-            "comms_lost_zero": "1",
             "sections": str(DEFAULT_SECTION_COUNT),
             "machine": "auto",
-            "base_rate": "0",
             "startup_scan": "1",
             "sct_hz": "2",
             "subnet": "255.255.255.255",
+            "log_keep_days": str(DEFAULT_LOG_KEEP_DAYS),
         }
         with open(CONFIG_PATH, "w") as f:
             config.write(f)
     else:
         config.read(CONFIG_PATH)
+    if not config.has_section("main"):
+        config.add_section("main")
+
+    # base_rate used to pin the Amados rate and ignore the terminal. The rate
+    # now always comes from the terminal; keep the value as the remembered
+    # fallback for when the terminal reports 0.
+    legacy = config.getfloat("main", "base_rate", fallback=0.0)
+    if config.has_option("main", "base_rate"):
+        if legacy > 0 and config.getfloat("main", "last_base_rate", fallback=0.0) <= 0:
+            config.set("main", "last_base_rate", f"{legacy:g}")
+        config.remove_option("main", "base_rate")
+        try:
+            save_config(config)
+        except OSError as e:
+            logger.warning(f"Could not update config.ini: {e}")
+        if legacy > 0:
+            logger.info(f"config.ini: base_rate = {legacy:g} no longer overrides the "
+                        f"terminal; the rate is read from the terminal and set in "
+                        f"the bridge window")
     return config
 
 
@@ -279,11 +327,14 @@ class ASDRequester:
     def shutdown(self):
         """Called before the serial port closes."""
 
-    def on_agio_lost(self, comms_lost_zero: bool):
+    def on_agio_lost(self):
+        # Hand the machine back fully open: all sections on, GPS auto flag
+        # off (agio_connected is cleared first). periodic_loop sends it.
         self.agio_connected = False
-        if comms_lost_zero:
-            self.update_sections_from_aog(0x00, 0x00)
-            self.update_speed_from_aog(0.0)
+        all_on = (1 << min(self.section_count, 16)) - 1
+        logger.info("AgIO lost: all sections on")
+        self.update_sections_from_aog(all_on & 0xFF, all_on >> 8)
+        self.update_speed_from_aog(0.0)
         if self.state == MachineState.RUNNING:
             self.enter_ready("AgIO timeout")
 
@@ -343,8 +394,10 @@ class ASDRequester:
                         build_section_request(self.tool_id), "SECT_REQ")
                     self.last_sct_time = now
 
-            # --- RUNNING: send section commands on change ---
-            if self.state == MachineState.RUNNING and self.section_change:
+            # --- READY / RUNNING: send section commands on change (READY:
+            #     the all-on hand-back after AgIO was lost) ---
+            if self.state in (MachineState.READY, MachineState.RUNNING) \
+                    and self.section_change:
                 with self.sections_lock:
                     sects = self.target_sections
                     self.section_change = False
@@ -477,16 +530,25 @@ class AmadosRequester(ASDRequester):
     index 2 = right) gets its own rate setpoint: every closed AgOpenGPS
     section removes 1/per_side of the base rate from its side.
 
-    Index 0 (the machine-wide setpoint) is never written. The base rate is
-    read from the terminal before the first write; afterwards, if the
-    terminal's target no longer matches the average of our side rates, the
-    operator changed it on the terminal and it becomes the new base.
+    Index 0 (the machine-wide setpoint) is never written. The base rate
+    always comes from the terminal: it is read before the first write, and
+    afterwards, if the terminal's target no longer matches the average of
+    our side rates, the operator changed it on the terminal and it becomes
+    the new base. The remembered rate (last_base_rate) is only used when
+    the terminal reports 0 before we wrote anything (left closed by a run
+    that could not restore). A 0 we caused ourselves (all sections closed)
+    is ignored. The operator can also set the base from the bridge window.
     """
 
     POLL_OBJECTS = (OBJ_TARGET_RATE, OBJ_ACTUAL_RATE, OBJ_WIDTH, OBJ_SPEED)
 
+    # Where base_rate came from (shown in the window)
+    SRC_TERMINAL = "terminal"
+    SRC_REMEMBERED = "remembered"
+    SRC_PC = "pc"
+
     def __init__(self, ser: serial.Serial, section_count: int,
-                 sct_hz: int, config: ConfigParser, base_rate: float = 0.0):
+                 sct_hz: int, config: ConfigParser):
         super().__init__(ser, section_count, sct_hz, config)
         self.per_side = max(1, section_count // 2)
         self.section_mask = 0               # AOG sections, bit 0 = section 1
@@ -494,14 +556,18 @@ class AmadosRequester(ASDRequester):
         self.last_sections_time = 0.0
         self.controlling = False            # True while AgOpenGPS drives us
 
-        self.base_rate: Optional[float] = base_rate if base_rate > 0 else None
-        self.fixed_base = base_rate > 0
+        self.base_rate: Optional[float] = None
+        self.base_source: Optional[str] = None
+        self.terminal_zero = False          # terminal read 0 before our first write
+        self.pending_base: Optional[float] = None   # set from the window
+        self.config_error = ""
         self.target_avg: Optional[float] = None
         self.actual_rate: Optional[float] = None
         self.width: Optional[float] = None
         self.speed: Optional[float] = None
 
         self.cmd = {SIDE_LEFT: None, SIDE_RIGHT: None}
+        self.resend = False
         self.last_write_time = 0.0
         self.last_poll_time = 0.0
         self.poll_idx = 0
@@ -509,8 +575,7 @@ class AmadosRequester(ASDRequester):
         logger.info(f"Amados mode: {self.per_side * 2} sections, "
                     f"1-{self.per_side} = left, "
                     f"{self.per_side + 1}-{self.per_side * 2} = right, "
-                    f"{100 / self.per_side:.0f}% per section, base rate "
-                    + (f"{base_rate} (config)" if self.fixed_base else "from terminal"))
+                    f"{100 / self.per_side:.0f}% per section, base rate from terminal")
 
     # ---- side rate calculation ----
 
@@ -533,7 +598,8 @@ class AmadosRequester(ASDRequester):
     def apply(self, now: float, force: bool = False):
         want = self.side_rates()
         changed = [s for s in want if want[s] != self.cmd[s]]
-        refresh = (now - self.last_write_time) >= AMADOS_REFRESH_S
+        refresh = (now - self.last_write_time) >= AMADOS_REFRESH_S or self.resend
+        self.resend = False
         if changed:
             logger.info(f"Sections {self.section_mask:0{self.per_side * 2}b} -> "
                         f"left {want[SIDE_LEFT]:.1f} / right {want[SIDE_RIGHT]:.1f} kg/ha "
@@ -585,10 +651,32 @@ class AmadosRequester(ASDRequester):
                     logger.info("AgOpenGPS now controls the side rates")
                     self.controlling = True
 
+                if self.pending_base is not None:
+                    self._apply_pc_base(now)
+
                 if self.controlling and self.base_rate:
                     self.apply(now)
 
             time.sleep(TICK_S)
+
+    def request_base(self, rate: float):
+        """Called from the window: use this base rate and send it to the
+        terminal (written by periodic_loop)."""
+        self.pending_base = rate
+
+    def _apply_pc_base(self, now: float):
+        rate, self.pending_base = self.pending_base, None
+        logger.info(f"Base rate set in the bridge window: {rate:g} kg/ha")
+        self._set_base(rate, self.SRC_PC)
+        self.terminal_zero = False
+        if self.controlling:
+            self.apply(now, force=True)
+        else:
+            # Not driven by AgOpenGPS: both sides at the new base, so the
+            # terminal shows the new rate right away
+            for side in (SIDE_LEFT, SIDE_RIGHT):
+                self.write_side(side, rate, "(set in window)")
+                time.sleep(0.03)
 
     def release(self, reason: str):
         """Hand the machine back to the terminal: both sides to the base
@@ -615,9 +703,10 @@ class AmadosRequester(ASDRequester):
         if self.controlling:
             self.release("Bridge closing")
 
-    def on_agio_lost(self, comms_lost_zero: bool):
-        # Don't zero the sections: periodic_loop hands the machine back to
-        # the terminal (base rate) once section data stops arriving.
+    def on_agio_lost(self):
+        # Don't touch the sections: periodic_loop hands the machine back to
+        # the terminal (both sides at the base rate = all sections on) once
+        # section data stops arriving.
         self.agio_connected = False
         if self.state == MachineState.RUNNING:
             self.enter_ready("AgIO timeout")
@@ -684,45 +773,68 @@ class AmadosRequester(ASDRequester):
             self.enter_ready("ASD init confirmed")
 
     def _check_base(self, target: float):
-        if self.fixed_base:
-            return
-        if self.cmd[SIDE_LEFT] is None or self.cmd[SIDE_RIGHT] is None:
-            # Nothing written yet: the terminal's target is the base rate
-            if target <= 0:
-                # Most likely left closed by a run that was killed before it
-                # could restore; fall back to the last base we learned.
-                last = self.config.getfloat("main", "last_base_rate", fallback=0.0)
-                if last > 0 and self.base_rate != last:
-                    logger.warning(f"Terminal target is 0 (left closed by a previous "
-                                   f"run?): using last known base rate {last:.1f} kg/ha")
-                    self.base_rate = last
-                elif last <= 0 and self.base_rate is not None:
-                    logger.warning("Terminal target is 0 and no last_base_rate in "
-                                   "config.ini: set the rate on the terminal")
-                    self.base_rate = None
-                return
-            if target != self.base_rate:
-                logger.info(f"Base rate from terminal: {target:.1f} kg/ha")
-                self._set_base(target)
-            return
+        # A read that crossed one of our writes still shows the old value
+        # (e.g. 0 right after release() restored a fully closed machine)
         if time.time() - self.last_write_time < AMADOS_SETTLE_S:
             return
-        expected = (self.cmd[SIDE_LEFT] + self.cmd[SIDE_RIGHT]) / 2
-        if abs(target - expected) > AMADOS_REBASE_TOL and target > 0:
-            logger.info(f"Target changed on terminal (expected {expected:.1f}, "
-                        f"now {target:.1f}): new base rate {target:.1f} kg/ha")
-            self._set_base(target)
-            self.cmd = {SIDE_LEFT: None, SIDE_RIGHT: None}   # force re-apply
 
-    def _set_base(self, rate: float):
-        """Adopt a learned base rate and remember it for the next start."""
+        if self.cmd[SIDE_LEFT] is None or self.cmd[SIDE_RIGHT] is None:
+            # Nothing of ours on the terminal: its target is the base rate
+            if target > 0:
+                self.terminal_zero = False
+                if target != self.base_rate or self.base_source != self.SRC_TERMINAL:
+                    logger.info(f"Base rate from terminal: {target:.1f} kg/ha")
+                    self._set_base(target, self.SRC_TERMINAL)
+                return
+            # Terminal at 0: most likely left closed by a run that was killed
+            # or lost power before it could restore. Keep a base we already
+            # have, else fall back to the remembered one.
+            first = not self.terminal_zero
+            self.terminal_zero = True
+            if self.base_rate is not None:
+                return
+            last = self.config.getfloat("main", "last_base_rate", fallback=0.0)
+            if last > 0:
+                logger.warning(f"Terminal target is 0 (left closed by a previous "
+                               f"run?): using last known base rate {last:.1f} kg/ha")
+                self._set_base(last, self.SRC_REMEMBERED)
+            elif first:
+                logger.warning("Terminal target is 0 and no rate is remembered: "
+                               "set the rate on the terminal or in the bridge window")
+            return
+
+        expected = (self.cmd[SIDE_LEFT] + self.cmd[SIDE_RIGHT]) / 2
+        if target > 0:
+            self.terminal_zero = False
+            if abs(target - expected) > AMADOS_REBASE_TOL:
+                logger.info(f"Target changed on terminal (expected {expected:.1f}, "
+                            f"now {target:.1f}): new base rate {target:.1f} kg/ha")
+                self._set_base(target, self.SRC_TERMINAL)
+                self.cmd = {SIDE_LEFT: None, SIDE_RIGHT: None}   # force re-apply
+        elif expected > 0 and self.controlling:
+            # We sent rates but the terminal reads 0: keep the base, send again.
+            # (0 while all sections are closed is our own doing: ignored.)
+            if not self.terminal_zero:
+                logger.warning(f"Terminal target reads 0 although {expected:.1f} was "
+                               f"sent: keeping base {self.base_rate:.1f}, sending again")
+            self.terminal_zero = True
+            self.resend = True
+
+    def _set_base(self, rate: float, source: str):
+        """Adopt a base rate and remember it for the next start."""
         self.base_rate = rate
+        self.base_source = source
+        if source == self.SRC_REMEMBERED:
+            return
         try:
             if self.config.get("main", "last_base_rate", fallback="") != f"{rate:g}":
                 self.config.set("main", "last_base_rate", f"{rate:g}")
                 save_config(self.config)
+            self.config_error = ""
         except Exception as e:
-            logger.warning(f"Could not save last_base_rate: {e}")
+            if not self.config_error:
+                logger.warning(f"Could not save last_base_rate: {e}")
+            self.config_error = str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -745,20 +857,28 @@ def receiver_loop(ser: serial.Serial, parser: ASDStreamParser,
                 req.handle_frame(frame)
 
         except Exception as e:
+            if not req.running:         # port closed by Bridge.stop()
+                break
             logger.warning(f"RX error: {e}")
             time.sleep(0.2)
 
 
-def udp_listener_loop(req: ASDRequester, comms_lost_zero: bool,
-                      subnet: str):
-    """Thread: receives AgOpenGPS PGNs via UDP, updates shared state,
-    and sends Hello reply + From Machine PGN back to AgIO."""
+def open_udp_socket() -> socket.socket:
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    if hasattr(socket, "SIO_UDP_CONNRESET"):
+        # Windows: an ICMP "port unreachable" for one of our replies would
+        # make the next recvfrom() fail with WinError 10054
+        sock.ioctl(socket.SIO_UDP_CONNRESET, False)
     sock.bind(("", UDP_PORT))
     sock.settimeout(UDP_TIMEOUT_S)
     logger.info(f"UDP listening on port {UDP_PORT}")
+    return sock
 
+
+def udp_listener_loop(sock: socket.socket, req: ASDRequester, subnet: str):
+    """Thread: receives AgOpenGPS PGNs via UDP, updates shared state,
+    and sends Hello reply + From Machine PGN back to AgIO."""
     broadcast = (subnet, AOG_PORT)
     got_e5 = False
     logger.info(f"UDP broadcast -> {broadcast}")
@@ -769,7 +889,9 @@ def udp_listener_loop(req: ASDRequester, comms_lost_zero: bool,
         except socket.timeout:
             if req.agio_connected:
                 logger.info("AgIO timeout -- connection lost")
-                req.on_agio_lost(comms_lost_zero)
+                req.on_agio_lost()
+            continue
+        except ConnectionResetError:
             continue
         except OSError:
             if not req.running:
@@ -876,10 +998,14 @@ def _describe_value(data: bytes) -> str:
     return out
 
 
-def scan_objects(ser: serial.Serial, wait_s: float = 15.0) -> set:
+def scan_objects(ser: serial.Serial, wait_s: float = 15.0,
+                 progress: Optional[Callable[[float], None]] = None,
+                 stop: Optional[Callable[[], bool]] = None) -> set:
     """Read every object 0x00-0xFF once (reads only, nothing is written) and
     log what the terminal supports. Returns the objects that answered with
-    data. Waits up to wait_s for the terminal to answer the init first."""
+    data. Waits up to wait_s for the terminal to answer the init first.
+    progress(fraction) is called per object; stop() aborts the scan."""
+    stop = stop or (lambda: False)
     parser = ASDStreamParser()
     end = time.time() + wait_s
     while True:
@@ -889,11 +1015,18 @@ def scan_objects(ser: serial.Serial, wait_s: float = 15.0) -> set:
         if time.time() > end:
             logger.warning("Startup scan skipped: terminal not answering init")
             return set()
+        if stop():
+            return set()
         time.sleep(0.5)
 
     logger.info("Startup scan: reading objects 0x00-0xFF (read only, ~10 s) ...")
     answered, rejected, silent = set(), {}, []
     for obj in range(0x100):
+        if stop():
+            logger.info("Startup scan aborted")
+            return answered
+        if progress:
+            progress(obj / 0x100)
         if obj == 0x01:                         # init object
             continue
         f = _ask(ser, parser, build_read(obj))
@@ -932,13 +1065,144 @@ def pick_machine(answered: set) -> str:
 
 
 # ---------------------------------------------------------------------------
-#  Console close (window X, logoff, shutdown)
+#  Bridge -- serial port, requester and worker threads
+# ---------------------------------------------------------------------------
+
+class Bridge:
+    """Opens the port, runs the startup scan, picks the machine mode and
+    starts the worker threads. start() blocks for the scan (~10 s), so the
+    window calls it from a thread; stop() hands the machine back (restores
+    the base rate) and closes everything. Used by the window and --console."""
+
+    IDLE, OPENING, SCANNING, RUNNING, ERROR = (
+        "idle", "opening", "scanning", "running", "error")
+
+    def __init__(self, config: ConfigParser):
+        self.config = config
+        self.port = ""
+        self.machine = ""
+        self.phase = self.IDLE
+        self.error = ""
+        self.scan_progress = 0.0
+        self.ser: Optional[serial.Serial] = None
+        self.sock: Optional[socket.socket] = None
+        self.requester: Optional[ASDRequester] = None
+        self.threads = []
+        self._stop = threading.Event()
+        self._lock = threading.Lock()       # serializes start / stop
+
+    def start(self, port: str) -> bool:
+        self._stop.clear()
+        with self._lock:
+            self.port, self.error, self.scan_progress = port, "", 0.0
+            self.requester = None
+            try:
+                return self._start(port)
+            except Exception as e:
+                logger.error(f"Could not start on {port}: {e}")
+                self._close()
+                self.error = str(e)
+                self.phase = self.ERROR
+                return False
+
+    def _start(self, port: str) -> bool:
+        cfg = self.config
+        section_count = cfg.getint("main", "sections", fallback=DEFAULT_SECTION_COUNT)
+        sct_hz = cfg.getint("main", "sct_hz", fallback=2)
+        subnet = cfg.get("main", "subnet", fallback="255.255.255.255")
+        machine = cfg.get("main", "machine", fallback="auto").strip().lower()
+        startup_scan = cfg.getboolean("main", "startup_scan", fallback=True)
+        logger.info(f"Config: machine={machine}  sections={section_count}  "
+                    f"SCT={sct_hz}Hz  subnet={subnet}")
+
+        self.phase = self.OPENING
+        logger.info(f"Opening {port} @ {BAUD} baud")
+        self.ser = serial.Serial(
+            port=port,
+            baudrate=BAUD,
+            bytesize=serial.EIGHTBITS,
+            parity=serial.PARITY_NONE,
+            stopbits=serial.STOPBITS_ONE,
+            timeout=0.05,
+        )
+        # Bind UDP before the scan, so a second instance fails right away
+        self.sock = open_udp_socket()
+
+        answered = set()
+        if startup_scan or machine not in ("amados", "quantron"):
+            self.phase = self.SCANNING
+            answered = scan_objects(
+                self.ser, progress=lambda f: setattr(self, "scan_progress", f),
+                stop=self._stop.is_set)
+        if self._stop.is_set():
+            self._close()
+            self.phase = self.IDLE
+            return False
+        if machine not in ("amados", "quantron"):
+            machine = pick_machine(answered)
+        elif machine == "quantron":
+            logger.warning("machine = quantron: section-bitmask mode is EXPERIMENTAL, "
+                           "untested on real hardware")
+        self.machine = machine
+
+        if machine == "amados":
+            req = AmadosRequester(self.ser, section_count, sct_hz, cfg)
+        else:
+            req = ASDRequester(self.ser, section_count, sct_hz, cfg)
+
+        self.threads = [
+            threading.Thread(target=udp_listener_loop, name="udp",
+                             args=(self.sock, req, subnet), daemon=True),
+            threading.Thread(target=receiver_loop, name="serial-rx",
+                             args=(self.ser, ASDStreamParser(), req), daemon=True),
+            threading.Thread(target=req.periodic_loop, name="periodic", daemon=True),
+        ]
+        for t in self.threads:
+            t.start()
+        self.requester = req
+        self.phase = self.RUNNING
+        return True
+
+    def stop(self):
+        """Hand the machine back to the terminal and close the port."""
+        self._stop.set()
+        with self._lock:
+            req = self.requester
+            if req is not None:
+                req.running = False
+                time.sleep(0.3)
+                try:
+                    req.shutdown()
+                except Exception as e:
+                    logger.warning(f"Shutdown failed: {e}")
+            was_open = self.ser is not None
+            self._close()
+            if was_open:
+                logger.info("Serial port closed")
+            if self.phase != self.ERROR:
+                self.phase = self.IDLE
+
+    def _close(self):
+        for res in (self.sock, self.ser):
+            if res is not None:
+                try:
+                    res.close()
+                except Exception:
+                    pass
+        self.sock = self.ser = None
+        for t in self.threads:
+            t.join(timeout=1.0)
+        self.threads = []
+
+
+# ---------------------------------------------------------------------------
+#  Console mode (--console): close handler (window X, logoff, shutdown)
 # ---------------------------------------------------------------------------
 
 _console_handler = None     # keep a reference, or ctypes frees the callback
 
 
-def install_console_close_handler(req: ASDRequester, ser: serial.Serial):
+def install_console_close_handler(bridge: Bridge):
     """Run the normal shutdown (restore rates) when the console window is
     closed. Windows gives the process ~5 s after CTRL_CLOSE_EVENT."""
     global _console_handler
@@ -949,12 +1213,8 @@ def install_console_close_handler(req: ASDRequester, ser: serial.Serial):
     def handler(event):
         if event in (2, 5, 6):      # CLOSE, LOGOFF, SHUTDOWN
             logger.info("Console closing -- shutting down")
-            req.running = False
-            time.sleep(0.3)
             try:
-                req.shutdown()
-                time.sleep(0.2)
-                ser.close()
+                bridge.stop()
             except Exception as e:
                 logger.warning(f"Shutdown on close failed: {e}")
             logging.shutdown()
@@ -966,30 +1226,20 @@ def install_console_close_handler(req: ASDRequester, ser: serial.Serial):
         logger.warning("Could not install console close handler")
 
 
-# ---------------------------------------------------------------------------
-#  Main
-# ---------------------------------------------------------------------------
+def attach_console():
+    """The exe is built without a console; give --console one."""
+    import ctypes
+    if ctypes.windll.kernel32.AllocConsole():
+        sys.stdout = sys.stderr = open("CONOUT$", "w", buffering=1)
+        sys.stdin = open("CONIN$", "r")
 
-def main():
+
+def run_console(config: ConfigParser):
     print("AOG-ASD Bridge  (AgOpenGPS -> ASD section control terminal)")
     print()
 
-    # --- config ---
-    config = load_config()
-    saved_com = config.get("main", "com", fallback="0")
-    comms_lost_zero = config.getboolean("main", "comms_lost_zero", fallback=True)
-    section_count = config.getint("main", "sections", fallback=DEFAULT_SECTION_COUNT)
-    sct_hz = config.getint("main", "sct_hz", fallback=2)
-    subnet = config.get("main", "subnet", fallback="255.255.255.255")
-    machine = config.get("main", "machine", fallback="auto").strip().lower()
-    base_rate = config.getfloat("main", "base_rate", fallback=0.0)
-    startup_scan = config.getboolean("main", "startup_scan", fallback=True)
-
-    print(f"Config: machine={machine}  sections={section_count}  SCT={sct_hz}Hz  "
-          f"comms_lost_zero={comms_lost_zero}  subnet={subnet}")
-    print()
-
     # --- COM port selection ---
+    saved_com = config.get("main", "com", fallback="0")
     available = {p.device for p in serial.tools.list_ports.comports()}
     if saved_com != "0" and saved_com in available:
         print(f"Using saved COM port: {saved_com}")
@@ -1003,62 +1253,40 @@ def main():
         config.set("main", "com", port)
         save_config(config)
 
-    logger.info(f"Opening {port} @ {BAUD} baud")
-
-    ser = serial.Serial(
-        port=port,
-        baudrate=BAUD,
-        bytesize=serial.EIGHTBITS,
-        parity=serial.PARITY_NONE,
-        stopbits=serial.STOPBITS_ONE,
-        timeout=0.05,
-    )
-
-    parser = ASDStreamParser()
-    answered = scan_objects(ser) if startup_scan else set()
-    if machine not in ("amados", "quantron"):
-        if not startup_scan:
-            answered = scan_objects(ser)
-        machine = pick_machine(answered)
-    elif machine == "quantron":
-        logger.warning("machine = quantron: section-bitmask mode is EXPERIMENTAL, "
-                       "untested on real hardware")
-
-    if machine == "amados":
-        requester = AmadosRequester(ser, section_count, sct_hz, config, base_rate)
-    else:
-        requester = ASDRequester(ser, section_count, sct_hz, config)
-
-    # --- start threads ---
-    threads = [
-        threading.Thread(target=udp_listener_loop,
-                         args=(requester, comms_lost_zero, subnet), daemon=True),
-        threading.Thread(target=receiver_loop,
-                         args=(ser, parser, requester), daemon=True),
-        threading.Thread(target=requester.periodic_loop, daemon=True),
-        threading.Thread(target=keyboard_loop,
-                         args=(requester,), daemon=True),
-    ]
-    for t in threads:
-        t.start()
-
-    install_console_close_handler(requester, ser)
+    bridge = Bridge(config)
+    if not bridge.start(port):
+        input("Press Enter to exit")
+        return
+    req = bridge.requester
+    threading.Thread(target=keyboard_loop, args=(req,), daemon=True).start()
+    install_console_close_handler(bridge)
 
     try:
-        while requester.running:
+        while req.running:
             time.sleep(0.2)
     except KeyboardInterrupt:
-        requester.running = False
         logger.info("KeyboardInterrupt")
     finally:
-        requester.running = False
-        time.sleep(0.3)
-        try:
-            requester.shutdown()
-        except Exception as e:
-            logger.warning(f"Shutdown failed: {e}")
-        ser.close()
-        logger.info("Serial port closed")
+        bridge.stop()
+
+
+# ---------------------------------------------------------------------------
+#  Main
+# ---------------------------------------------------------------------------
+
+def main():
+    console = "--console" in sys.argv[1:]
+    if console and sys.stdout is None:
+        attach_console()
+    setup_logging(console)
+    config = load_config()
+    archive_logs(config)
+
+    if console:
+        run_console(config)
+    else:
+        import bridge_gui
+        bridge_gui.run(sys.modules[__name__], config)
 
 
 if __name__ == "__main__":
