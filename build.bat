@@ -17,7 +17,7 @@ if exist "%~dp0icon.ico" (
     set ICON_FLAG=
     echo WARNING: icon.ico not found!
 )
-python -m PyInstaller --onefile --console --name "AOG-ASD" %ICON_FLAG% "%~dp0AOG_ASD_bridge.py"
+python -m PyInstaller --onefile --windowed --name "AOG-ASD" %ICON_FLAG% --add-data "%~dp0icon.ico;." --add-data "%~dp0lang;lang" --add-data "%~dp0RAUCH_pinout.png;." "%~dp0AOG_ASD_bridge.py"
 python -m PyInstaller --onefile --console --name "AOG-ASD-Sniffer" %ICON_FLAG% "%~dp0asd_sniffer.py"
 python -m PyInstaller --onefile --console --name "AOG-ASD-Probe" %ICON_FLAG% "%~dp0asd_probe.py"
 if exist "%~dp0dist\AOG-ASD.exe" (

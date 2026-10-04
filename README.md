@@ -83,10 +83,41 @@ later. Not tested with this bridge yet.
 
 ## Usage
 
-Run `AOG-ASD.exe`. On first run you will be prompted to select a COM port.
-The choice is saved to `config.ini` so subsequent runs connect automatically.
+Run `AOG-ASD.exe`. It opens a window (made for touch screens) showing:
 
-Press **X** to exit.
+- the terminal and AgIO connection, and whether AgOpenGPS or the terminal
+  is in control;
+- the **base rate** (Amados) and where it came from, with −10 / −1 / +1 /
+  +10 buttons (hold to repeat) and **Set rate** to send a new one;
+- the sections AgOpenGPS commands, split into left / right side, with the
+  rate sent to each side (→) and the rate the terminal reports (←);
+- the terminal's working width (large: 36 / 18 / 0 m shows which sides
+  really spread), actual rate and speed;
+- the log; **Logs** saves the recent logs plus config.ini into one zip in
+  `logs/export` and opens it in Explorer, ready to copy to a USB stick;
+- **⚙** settings, including a **Connector pinout** page with the wiring
+  below.
+
+On first run pick the COM port at the bottom and press **Connect**; the
+port is saved to `config.ini` and used automatically next time. Closing the
+window hands the machine back to the terminal (both sides at the base rate).
+
+`AOG-ASD.exe --console` (or `python AOG_ASD_bridge.py --console`) runs the
+old text mode; press **X** to exit.
+
+### Languages
+
+Window texts are in `lang/<code>.ini` (English, Magyar, Français, Deutsch,
+Polski included). Pick one in Settings; `auto` follows the Windows language.
+To add or fix a language, copy `lang/en.ini` to a `lang` folder next to
+`AOG-ASD.exe` under a new name (e.g. `lang/it.ini`), translate the values
+and restart. Missing keys fall back to English.
+
+### Logs
+
+Each run writes a DEBUG log to `logs/`. At startup, logs of earlier runs are
+zipped into `logs/archive/<date>.zip` and archives older than
+`log_keep_days` (default 7) are deleted.
 
 ## Features
 
@@ -95,7 +126,7 @@ Press **X** to exit.
 | Section control | Sends section ON/OFF commands to ASD terminal |
 | Section feedback | Reports actual terminal section state back to AgOpenGPS |
 | GPS auto mode | Sets GPS-auto flag (byte 3 bit 7) on the ASD bus |
-| Comms-lost safety | Sections zeroed when AgIO connection is lost |
+| Comms-lost safety | AgIO / AgOpenGPS lost: all sections back on (Amados: both sides at the base rate), terminal in control |
 | Auto-reconnect | 3-state machine handles connection loss and recovery |
 | Configurable section count | Supports 4 or 8 section Quantron variants |
 
@@ -182,13 +213,34 @@ Sections are emulated with per-side rates. With `sections = 8`, sections
 1-4 are the left side and 5-8 the right side; each closed section removes
 25 % of the base rate from its side, so 1-4 closed = left side at 0.
 
-The base rate is read from the terminal (`0x00`) before the first write. If
-the terminal's target later stops matching the average of the side rates
-the bridge sent, the operator changed it on the terminal and it becomes the
-new base. Set `base_rate` to pin it instead. On exit (X key, Ctrl+C or
-closing the console window) both sides are restored to the base rate. If
-the terminal still reads 0 at startup (e.g. the bridge was killed), the
-bridge falls back to `last_base_rate` from config.ini.
+The base rate always comes from the terminal (`0x00`): it is read before
+the first write, and if the terminal's target later stops matching the
+average of the side rates the bridge sent, the operator changed it on the
+terminal and it becomes the new base. It can also be set in the window.
+
+The bridge only uses its own rate when the terminal reports 0:
+- at startup, before the bridge wrote anything (the machine was left closed
+  by a run that could not restore, e.g. power cut): the last known rate
+  (`last_base_rate`) is used and the window shows a warning;
+- while spreading (sections open) the terminal suddenly reads 0: the side
+  rates are sent again.
+
+A 0 the bridge caused itself (all sections closed) is ignored. Reads that
+cross one of the bridge's own writes are skipped for 2 s.
+
+The terminal only reports one target for the whole machine. The window shows
+it under each side as "reported"; when it matches what was sent, each side
+shows its own confirmed value.
+
+Both sides are restored to the base rate (100 %) and control is handed
+back to the terminal when:
+- no section data arrives from AgOpenGPS for 3 s (AgOpenGPS or AgIO
+  closed, network lost); the bridge takes over again when it returns;
+- the bridge exits (window closed, Windows shutdown, or X / Ctrl+C /
+  closing the console in `--console` mode).
+
+In section-bitmask mode (Quantron), losing AgIO sends all sections on with
+the GPS auto flag cleared.
 
 The shutters are slow (a 250 -> 0 ramp needs ~10 s to be followed), so give
 AgOpenGPS enough section look-ahead.
@@ -232,32 +284,37 @@ Created automatically on first run.
 ```ini
 [main]
 com = COM3
-comms_lost_zero = 1
 sections = 8
 sct_hz = 2
 subnet = 255.255.255.255
 machine = auto
-base_rate = 0
 startup_scan = 1
+log_keep_days = 7
+language = auto
 ```
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
-| `com` | `0` (prompt) | Serial port. Set to `0` to prompt on startup |
-| `comms_lost_zero` | `1` | Zero all sections when AgIO connection is lost |
+| `com` | `0` | Serial port, set from the window. `0` = choose on startup |
 | `sections` | `8` | Number of sections (4 or 8 for Quantron) |
 | `sct_hz` | `2` | Section request polling rate in Hz |
 | `subnet` | `255.255.255.255` | UDP broadcast address |
 | `machine` | `auto` | `auto` (pick from the startup scan), `amados` (per-side rates) or `quantron` (section bitmask `0x55`, experimental) |
 | `startup_scan` | `1` | Log a read-only scan of all ASD objects at every start (~10 s) |
-| `base_rate` | `0` | Amados only: base rate kg/ha, `0` = read from the terminal |
-| `last_base_rate` | (written by the bridge) | Amados only: last learned base rate, used when the terminal reads 0 at startup |
+| `last_base_rate` | (written by the bridge) | Amados only: last base rate, used only when the terminal reads 0 at startup. An old `base_rate` setting is moved here (it no longer overrides the terminal) |
+| `log_keep_days` | `7` | Days to keep zipped logs, `0` = forever |
+| `language` | `auto` | Window language: `auto` (Windows language) or a file name from `lang/` (`en`, `hu`, `fr`, `de`, `pl`) |
+
+All of these except `com` and `last_base_rate` can be changed in Settings.
 
 ## Files
 
 | File | Purpose |
 |------|---------|
-| [AOG_ASD_bridge.py](AOG_ASD_bridge.py) | Main bridge. Threads: UDP, serial RX, periodic TX, keyboard |
+| [AOG_ASD_bridge.py](AOG_ASD_bridge.py) | Main bridge. Threads: UDP, serial RX, periodic TX (+ keyboard in `--console`) |
+| [bridge_gui.py](bridge_gui.py) | The window (tkinter) |
+| [i18n.py](i18n.py), [lang/](lang/) | Language loader and the language files |
+| [log_archive.py](log_archive.py) | Log zipping, pruning and export |
 | [asd_protocol.py](asd_protocol.py) | ASD framing, escaping, CRC, packet builders, stream parser |
 | [asd_sniffer.py](asd_sniffer.py) | `AOG-ASD-Sniffer.exe`: passive RS232 logger (never transmits) |
 | [asd_probe.py](asd_probe.py) | `AOG-ASD-Probe.exe`: object scan, `--watch`, rate `--ramp` tests |
