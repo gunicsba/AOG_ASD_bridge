@@ -91,8 +91,11 @@ Run `AOG-ASD.exe`. It opens a window (made for touch screens) showing:
   +10 buttons (hold to repeat) and **Set rate** to send a new one;
 - the sections AgOpenGPS commands, split into left / right side, with the
   rate sent to each side (→) and the rate the terminal reports (←);
+- the terminal's working width (large: 36 / 18 / 0 m shows which sides
+  really spread), actual rate and speed;
 - the log, plus **Settings**, **Logs folder** and **Export logs** (zips the
-  recent logs and config.ini, e.g. onto a USB stick).
+  recent logs and config.ini, e.g. onto a USB stick). Settings also has a
+  **Connector pinout** page with the wiring below.
 
 On first run pick the COM port at the bottom and press **Connect**; the
 port is saved to `config.ini` and used automatically next time. Closing the

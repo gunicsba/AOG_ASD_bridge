@@ -35,7 +35,7 @@ jobs:
         } else {
           Write-Host "WARNING: icon.ico not found!"
         }
-        pyinstaller --onefile --windowed --name "AOG-ASD" $ICON_FLAG --add-data "icon.ico;." --add-data "lang;lang" "AOG_ASD_bridge.py"
+        pyinstaller --onefile --windowed --name "AOG-ASD" $ICON_FLAG --add-data "icon.ico;." --add-data "lang;lang" --add-data "RAUCH_pinout.png;." "AOG_ASD_bridge.py"
         pyinstaller --onefile --console --name "AOG-ASD-Sniffer" $ICON_FLAG "asd_sniffer.py"
         pyinstaller --onefile --console --name "AOG-ASD-Probe" $ICON_FLAG "asd_probe.py"
 

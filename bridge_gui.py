@@ -335,14 +335,18 @@ class BridgeApp:
         self.sect_card.pack(fill="x", padx=pad, pady=4)
         self.sections = SectionBar(self.sect_card, self.scale, T)
         self.sections.pack(fill="x", pady=(2, 4))
-        self.machine_line = tk.Label(self.sect_card, bg=CARD, fg=MUTED, font=(FONT, 8))
+        # what the terminal reports for the whole machine; width is the key one
+        self.machine_row = tk.Frame(self.sect_card, bg=CARD)
+        self.m_width = self._metric(self.machine_row, T("lbl_width"), "m", 26)
+        self.m_actual = self._metric(self.machine_row, T("lbl_actual"), T("unit_rate"), 15)
+        self.m_speed = self._metric(self.machine_row, T("lbl_speed"), "km/h", 15)
 
         # footer (packed before the log so it never gets squeezed out)
         foot = tk.Frame(root, bg=BG)
         foot.pack(side="bottom", fill="x", padx=pad, pady=(4, pad))
         tk.Label(foot, text=T("port"), bg=BG, fg=MUTED).pack(side="left")
         self.port_var = tk.StringVar()
-        self.port_box = ttk.Combobox(foot, textvariable=self.port_var, width=22,
+        self.port_box = ttk.Combobox(foot, textvariable=self.port_var, width=16,
                                      state="readonly", postcommand=self._fill_ports,
                                      font=(FONT, 11))
         self.port_box.pack(side="left", padx=5, fill="y")
@@ -354,6 +358,10 @@ class BridgeApp:
                    command=self.open_logs).pack(side="right", padx=5)
         ttk.Button(foot, text=T("btn_settings"), command=self.open_settings).pack(side="right")
         self._fill_ports()
+        # never squeeze the footer: its width (language dependent) sets the minimum
+        root.update_idletasks()
+        root.minsize(max(int(620 * self.scale), foot.winfo_reqwidth() + 2 * pad),
+                     int(480 * self.scale))
 
         # log
         log_card = Card(root, T("card_log"))
@@ -377,6 +385,18 @@ class BridgeApp:
         self.log.bind("<ButtonPress-1>", self._drag_start)
         self.log.bind("<B1-Motion>", self._drag_move)
         self._append_log(list(self.log_lines), keep=False)
+
+    @staticmethod
+    def _metric(master, caption: str, unit: str, size: int) -> tk.Label:
+        box = tk.Frame(master, bg=CARD)
+        box.pack(side="left", anchor="s", padx=(0, 28))
+        tk.Label(box, text=caption, bg=CARD, fg=MUTED, font=(FONT, 9)).pack(anchor="w")
+        row = tk.Frame(box, bg=CARD)
+        row.pack(anchor="w")
+        value = tk.Label(row, text="–", bg=CARD, fg=TEXT, font=(FONT, size, "bold"))
+        value.pack(side="left")
+        tk.Label(row, text=unit, bg=CARD, fg=MUTED, font=(FONT, 10))             .pack(side="left", anchor="s", pady=(0, max(2, size // 5)), padx=(3, 0))
+        return value
 
     def rebuild(self):
         """Redraw everything (after a language change)."""
@@ -606,11 +626,11 @@ class BridgeApp:
             n = max(1, min(req.section_count, 16))
             ms = req.machine_sections
             self.sections.show(n, ms[0] | ms[1] << 8, None, req.state == MS.RUNNING)
-            self.machine_line.pack_forget()
+            self.machine_row.pack_forget()
         else:
             n = self.config.getint("main", "sections", fallback=8)
             self.sections.show(n, 0, None, False)
-            self.machine_line.pack_forget()
+            self.machine_row.pack_forget()
 
         self._refresh_banner(b, amados)
 
@@ -667,13 +687,17 @@ class BridgeApp:
             mask = (1 << count) - 1 if target else 0
         self.sections.show(count, mask, r.per_side, r.controlling, sides)
 
-        speed = "–" if r.speed is None else f"{r.speed:.1f}"
-        line = self.T("machine_line", actual=fmt_rate(r.actual_rate),
-                      width=fmt_rate(r.width), speed=speed)
-        if self.machine_line.cget("text") != line:
-            self.machine_line.config(text=line)
-        if not self.machine_line.winfo_ismapped():
-            self.machine_line.pack(anchor="w", padx=12, pady=(0, 8))
+        for label, text in ((self.m_width, fmt_rate(r.width)),
+                            (self.m_actual, fmt_rate(r.actual_rate)),
+                            (self.m_speed, "–" if r.speed is None else f"{r.speed:.1f}")):
+            if label.cget("text") != text:
+                label.config(text=text)
+        # width 0 = terminal not spreading: grey it out
+        fg = MUTED if not r.width else TEXT
+        if self.m_width.cget("fg") != fg:
+            self.m_width.config(fg=fg)
+        if not self.machine_row.winfo_ismapped():
+            self.machine_row.pack(anchor="w", padx=12, pady=(2, 10))
 
     def _refresh_banner(self, b, r):
         T = self.T
@@ -866,6 +890,8 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(btns, text=T("btn_save"), style="Accent.TButton",
                    command=self.save).pack(side="right")
         ttk.Button(btns, text=T("btn_cancel"), command=self.destroy).pack(side="right", padx=5)
+        ttk.Button(btns, text=T("btn_pinout"),
+                   command=lambda: PinoutDialog(self.app, self)).pack(side="left")
         self.bind("<Escape>", lambda e: self.destroy())
         self.grab_set()
 
@@ -905,6 +931,89 @@ class SettingsDialog(tk.Toplevel):
         self.app._save_config()
         self.destroy()
         self.app.settings_saved(bool(diff - set(self.NO_RECONNECT)), "language" in diff)
+
+
+class PinoutDialog(tk.Toplevel):
+    """Wiring of the ASD connector (same as the README): diagram + table."""
+    IMAGE = "RAUCH_pinout.png"
+    # Binder 680 pin, signal key, wire colour key, swatch, Sub-D 9 pin
+    PINS = (
+        ("1", "sig_wheel", "col_blue", "#3b4cc0", ""),
+        ("2", "sig_12v", "col_red", "#dc2626", ""),
+        ("3", "sig_gnd", "col_black", "#111827", "5"),
+        ("4", "sig_pto", "col_purple", "#8e44ad", ""),
+        ("5", "sig_work", "col_brown", "#b08463", ""),
+        ("6", "sig_radar", "col_lightblue", "#22a7d8", ""),
+        ("7", "sig_rxd", "col_green", "#22a447", "3"),
+        ("8", "sig_txd", "col_yellow", "#f2c12e", "2"),
+        ("S", "sig_shield", "", "", ""),
+    )
+
+    def __init__(self, app: BridgeApp, parent: tk.Toplevel):
+        super().__init__(parent, bg=CARD)
+        self.parent = parent
+        T = app.T
+        self.title(T("pinout_title"))
+        self.transient(parent)
+        self.resizable(False, False)
+
+        body = tk.Frame(self, bg=CARD)
+        body.pack(padx=16, pady=14)
+        try:
+            img = tk.PhotoImage(file=resource(self.IMAGE))
+            # fit ~60 % of the screen height
+            k = max(1, -(-img.height() // int(self.winfo_screenheight() * 0.6)))
+            self.img = img.subsample(k) if k > 1 else img
+            tk.Label(body, image=self.img, bg=CARD).pack(side="left", anchor="n")
+        except tk.TclError:
+            self.img = None
+
+        right = tk.Frame(body, bg=CARD)
+        right.pack(side="left", anchor="n", padx=(18, 0))
+        wrap = int(380 * app.scale)
+        tk.Label(right, text=T("pinout_intro"), bg=CARD, fg=TEXT, font=(FONT, 10),
+                 justify="left", wraplength=wrap).pack(anchor="w")
+
+        table = tk.Frame(right, bg=BORDER)              # 1 px grid lines
+        table.pack(anchor="w", pady=10)
+        heads = ("pinout_col_binder", "pinout_col_signal", "pinout_col_wire", "pinout_col_subd")
+        for c, key in enumerate(heads):
+            tk.Label(table, text=T(key), bg=GRAY_BG, fg=TEXT, font=(FONT, 9, "bold"),
+                     padx=8, pady=4).grid(row=0, column=c, sticky="nsew", padx=1, pady=1)
+        for r, (pin, sig, col, swatch, subd) in enumerate(self.PINS, start=1):
+            used = bool(subd)
+            bg = GREEN_BG if used else CARD
+            font = (FONT, 10, "bold") if used else (FONT, 10)
+            tk.Label(table, text=pin, bg=bg, font=font, padx=8, pady=3) \
+                .grid(row=r, column=0, sticky="nsew", padx=1, pady=1)
+            tk.Label(table, text=T(sig), bg=bg, font=font, padx=8, anchor="w") \
+                .grid(row=r, column=1, sticky="nsew", padx=1, pady=1)
+            cell = tk.Frame(table, bg=bg)
+            cell.grid(row=r, column=2, sticky="nsew", padx=1, pady=1)
+            if swatch:
+                tk.Frame(cell, bg=swatch, width=int(14 * app.scale),
+                         height=int(14 * app.scale)).pack(side="left", padx=(8, 4))
+                tk.Label(cell, text=T(col), bg=bg, font=font).pack(side="left", padx=(0, 8))
+            tk.Label(table, text=subd or "–", bg=bg, font=font, padx=8) \
+                .grid(row=r, column=3, sticky="nsew", padx=1, pady=1)
+
+        for key, fg in (("pinout_serial", TEXT), ("pinout_swap", TEXT),
+                        ("pinout_warn", RED_FG)):
+            tk.Label(right, text=T(key), bg=CARD, fg=fg, font=(FONT, 10), justify="left",
+                     wraplength=wrap).pack(anchor="w", pady=(0, 6))
+
+        btns = tk.Frame(self, bg=CARD)
+        btns.pack(fill="x", padx=16, pady=(0, 14))
+        ttk.Button(btns, text=T("btn_close"), style="Accent.TButton",
+                   command=self.close).pack(side="right")
+        self.bind("<Escape>", lambda e: self.close())
+        self.protocol("WM_DELETE_WINDOW", self.close)
+        self.grab_set()
+
+    def close(self):
+        self.destroy()
+        if self.parent.winfo_exists():
+            self.parent.grab_set()          # settings dialog is modal again
 
 
 def run(core, config):
