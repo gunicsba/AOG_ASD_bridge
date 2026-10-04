@@ -10,15 +10,17 @@ window only polls its state. Texts come from lang/<code>.ini (see i18n.py).
 
 import collections
 import ctypes
+import glob
 import logging
 import os
 import queue
+import subprocess
 import sys
 import threading
 import time
 import tkinter as tk
 import tkinter.font
-from tkinter import filedialog, messagebox, ttk
+from tkinter import messagebox, ttk
 
 import serial.tools.list_ports
 
@@ -28,6 +30,8 @@ import log_archive
 POLL_MS = 250
 LOG_LINES = 1000
 MAX_RATE = 5000.0
+EXPORT_SUBDIR = "export"     # logs/export: zips made by the Logs button
+EXPORT_KEEP = 5
 
 FONT = "Segoe UI"
 MONO = "Consolas"
@@ -247,6 +251,7 @@ class BridgeApp:
         st.map("Accent.TButton", background=[("active", "#1d4ed8"), ("pressed", "#1e40af"),
                                              ("disabled", "#93c5fd")])
         st.configure("Step.TButton", padding=(px(4), px(12)), font=(FONT, 12, "bold"))
+        st.configure("Icon.TButton", padding=(px(6), 0), font=("Segoe UI Symbol", 24))
         st.configure("TCombobox", padding=px(8), arrowsize=px(22))
         self.root.option_add("*TCombobox*Listbox.font", f"{{{FONT}}} 13")
         st.configure("TEntry", padding=px(6))
@@ -346,17 +351,16 @@ class BridgeApp:
         foot.pack(side="bottom", fill="x", padx=pad, pady=(4, pad))
         tk.Label(foot, text=T("port"), bg=BG, fg=MUTED).pack(side="left")
         self.port_var = tk.StringVar()
-        self.port_box = ttk.Combobox(foot, textvariable=self.port_var, width=16,
+        self.port_box = ttk.Combobox(foot, textvariable=self.port_var, width=22,
                                      state="readonly", postcommand=self._fill_ports,
                                      font=(FONT, 11))
         self.port_box.pack(side="left", padx=5, fill="y")
         self.conn_btn = ttk.Button(foot, text=T("btn_connect"), style="Accent.TButton",
                                    command=self.toggle_connection)
         self.conn_btn.pack(side="left")
-        ttk.Button(foot, text=T("btn_export"), command=self.export_logs).pack(side="right")
-        ttk.Button(foot, text=T("btn_logs_folder"),
-                   command=self.open_logs).pack(side="right", padx=5)
-        ttk.Button(foot, text=T("btn_settings"), command=self.open_settings).pack(side="right")
+        ttk.Button(foot, text="⚙", style="Icon.TButton", width=2,
+                   command=self.open_settings).pack(side="right", fill="y", padx=(5, 0))
+        ttk.Button(foot, text=T("btn_logs"), command=self.open_logs).pack(side="right")
         self._fill_ports()
         # never squeeze the footer: its width (language dependent) sets the minimum
         root.update_idletasks()
@@ -747,31 +751,31 @@ class BridgeApp:
     # ---- logs ----
 
     def open_logs(self):
-        os.makedirs(self.core.LOG_DIR, exist_ok=True)
-        os.startfile(self.core.LOG_DIR)
-
-    def export_logs(self):
-        T = self.T
+        """Logs button: dump the recent logs (+ config.ini) into one zip in
+        logs/export and show it in Explorer, ready to copy to a USB stick."""
         days = max(1, self.config.getint("main", "log_keep_days",
                                          fallback=self.core.DEFAULT_LOG_KEEP_DAYS))
-        dest = filedialog.asksaveasfilename(
-            parent=self.root, title=T("export_title"),
-            initialdir=os.path.join(os.path.expanduser("~"), "Desktop"),
-            initialfile=f"AOG-ASD-logs_{time.strftime('%Y%m%d_%H%M')}.zip",
-            defaultextension=".zip", filetypes=[(T("zip_files"), "*.zip")])
-        if not dest:
-            return
+        export_dir = os.path.join(self.core.LOG_DIR, EXPORT_SUBDIR)
+        os.makedirs(export_dir, exist_ok=True)
+        dest = os.path.join(export_dir, f"AOG-ASD-logs_{time.strftime('%Y%m%d_%H%M%S')}.zip")
         for h in logging.getLogger().handlers:
             h.flush()
         try:
             n = log_archive.export_logs(dest, self.core.LOG_DIR, days,
                                         extra_files=[self.core.CONFIG_PATH])
         except Exception as e:
-            messagebox.showerror(T("app_title"), T("export_failed", error=e), parent=self.root)
+            messagebox.showerror(self.T("app_title"), self.T("export_failed", error=e),
+                                 parent=self.root)
+            os.startfile(self.core.LOG_DIR)
             return
-        self.core.logger.info(f"Exported {n} log(s) of the last {days} days to {dest}")
-        messagebox.showinfo(T("app_title"), T("export_done", n=n, days=days, path=dest),
-                            parent=self.root)
+        self.core.logger.info(f"Saved {n} log(s) of the last {days} days to {dest}")
+        # keep only the newest few dumps
+        for old in sorted(glob.glob(os.path.join(export_dir, "AOG-ASD-logs_*.zip")))[:-EXPORT_KEEP]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+        subprocess.Popen(["explorer", "/select,", dest])
 
     # ---- settings ----
 

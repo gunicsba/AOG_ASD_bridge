@@ -93,9 +93,10 @@ Run `AOG-ASD.exe`. It opens a window (made for touch screens) showing:
   rate sent to each side (→) and the rate the terminal reports (←);
 - the terminal's working width (large: 36 / 18 / 0 m shows which sides
   really spread), actual rate and speed;
-- the log, plus **Settings**, **Logs folder** and **Export logs** (zips the
-  recent logs and config.ini, e.g. onto a USB stick). Settings also has a
-  **Connector pinout** page with the wiring below.
+- the log; **Logs** saves the recent logs plus config.ini into one zip in
+  `logs/export` and opens it in Explorer, ready to copy to a USB stick;
+- **⚙** settings, including a **Connector pinout** page with the wiring
+  below.
 
 On first run pick the COM port at the bottom and press **Connect**; the
 port is saved to `config.ini` and used automatically next time. Closing the
