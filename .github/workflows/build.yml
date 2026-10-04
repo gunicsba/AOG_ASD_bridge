@@ -56,5 +56,7 @@ jobs:
           dist/AOG-ASD-Sniffer.exe
           dist/AOG-ASD-Probe.exe
         generate_release_notes: true
+        # v0.4-beta1, v1.0-rc1 ... -> pre-release; v0.4 -> normal release
+        prerelease: ${{ contains(github.ref_name, '-') }}
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
